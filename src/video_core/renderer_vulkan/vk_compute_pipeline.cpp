@@ -5,7 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <string>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -167,6 +172,88 @@ constexpr u32 NS2CaptureRun = 300;
 std::filesystem::path NS2CaptureDirectory() {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_capture_yoshi-integration";
 }
+
+// NS2 diagnostics (verbatim port of EdenNS2 main's b103 LogSmallStorageBuffer, same log format so
+// the lines compare with main's logs): logs the contents of a small storage buffer the next
+// dispatch reads, after downloading data the host GPU wrote to it, with NaN/Inf counts for 32- and
+// 16-bit floats. EDEN_NS2_SSBO_PEEK=0 turns it off.
+void LogSmallStorageBuffer(Tegra::MemoryManager& gpu_memory, BufferCache& buffer_cache,
+                           u64 pipeline_hash, GPUVAddr address, u32 size) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NS2_SSBO_PEEK");
+        return !(value && value[0] == '0');
+    }();
+    constexpr u32 MaxBytes = 0x100;
+    if (!enabled || address == 0 || size > MaxBytes) {
+        return;
+    }
+    if (size == 0) {
+        // No size in the descriptor: the buffer cache binds up to the end of the mapping, show
+        // its start (the producer usually wrote only a few hundred bytes).
+        size = static_cast<u32>((std::min)(gpu_memory.GetMemoryLayoutSize(address), size_t{MaxBytes}));
+    }
+    size &= ~3U;
+    if (size == 0) {
+        return;
+    }
+    const auto device_address = gpu_memory.GpuToCpuAddress(address, size);
+    if (!device_address) {
+        return;
+    }
+    // Waits for the host GPU (only the first runs of each native pipeline get here).
+    buffer_cache.DownloadMemory(*device_address, size);
+    std::array<u32, MaxBytes / 4> words{};
+    gpu_memory.ReadBlockUnsafe(address, words.data(), size);
+    const u32 count = size / 4;
+    u32 nan32 = 0, inf32 = 0, nan16 = 0, inf16 = 0;
+    float max_abs = 0.0f;
+    std::string hex;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 word = words[i];
+        const float value = std::bit_cast<float>(word);
+        if (std::isnan(value)) {
+            ++nan32;
+        } else if (std::isinf(value)) {
+            ++inf32;
+        } else {
+            max_abs = (std::max)(max_abs, std::fabs(value));
+        }
+        for (const u32 half : {word & 0xffffU, word >> 16}) {
+            if ((half & 0x7c00U) == 0x7c00U) {
+                ++((half & 0x3ffU) ? nan16 : inf16);
+            }
+        }
+        hex += fmt::format("{}{:08x}", i % 8 == 0 ? (i == 0 ? "" : " |") : "", word);
+        if (i % 8 != 7 && i + 1 != count) {
+            hex += ' ';
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "NS2 storage buffer {:#x}+{:#x} read by pipeline {:016x}: f32 nan {} inf {} max|finite| {}, "
+             "f16 nan {} inf {}: {}",
+             address, size, pipeline_hash, nan32, inf32, max_abs, nan16, inf16, hex);
+}
+
+// NS2 diagnostics (yoshi-int-build-33): copies guest memory [address, address + size) to a file,
+// stopping at the first unmapped page. Returns the bytes written.
+u64 NS2SaveGuestMemory(Tegra::MemoryManager& gpu_memory, GPUVAddr address, u64 size,
+                       const std::filesystem::path& path) {
+    std::vector<u8> bytes;
+    bytes.reserve(size);
+    std::array<u8, 0x1000> page{};
+    for (GPUVAddr at = address; at < address + size;) {
+        const u64 chunk = (std::min<u64>)(0x1000 - (at & 0xfff), address + size - at);
+        if (!gpu_memory.GpuToCpuAddress(at)) {
+            break;
+        }
+        gpu_memory.ReadBlockUnsafe(at, page.data(), chunk);
+        bytes.insert(bytes.end(), page.begin(), page.begin() + chunk);
+        at += chunk;
+    }
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return bytes.size();
+}
 } // Anonymous namespace
 
 void ComputePipeline::NS2CaptureAfterDispatch(TextureCache& texture_cache) {
@@ -267,34 +354,80 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
 
-    // NS2 diagnostics (port of EdenNS2 main's b111 frame capture): once per session, the images
-    // Yoshi's DLSS reconstruction kernel reads and writes, before (and, for written images, after)
-    // its 300th run - the same program and run main captures by default (main identifies it by
-    // its pipeline hash a7e217052ec1940b; the lowered code differs here, so the native program key
-    // is used). Only reads images: rendering is unchanged. Files go to
+    // NS2 diagnostics (port of EdenNS2 main's b102/b103 resource log, same format): the resources
+    // of the first three runs of every native compute pipeline, and the contents of the small
+    // read-only storage buffers they read (the DLSS network output read by the reconstruction).
+    // The native program key is appended so pipelines can be matched with main's.
+    const bool native_first_runs = kepler_compute.IsNativeMode() && ns2_traced_runs < 3;
+    if (native_first_runs) {
+        ++ns2_traced_runs;
+        // Images in descriptor order: texture buffers, image buffers, sampled, storage ("w" written).
+        std::string described;
+        size_t view_index = 0;
+        const auto describe = [&](size_t count, const char* kind, bool written) {
+            for (size_t i = 0; i < count && view_index < views.size(); ++i, ++view_index) {
+                described += fmt::format(" {}{}:{}", kind, written ? "w" : "",
+                                         texture_cache.DescribeImageView(views[view_index].id));
+            }
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) describe(desc.count, "tb", false);
+        for (const auto& desc : info.image_buffer_descriptors) describe(desc.count, "ib", desc.is_written);
+        for (const auto& desc : info.texture_descriptors) describe(desc.count, "t", false);
+        for (const auto& desc : info.image_descriptors) describe(desc.count, "i", desc.is_written);
+        // Storage buffers as the guest describes them: 64-bit address and 32-bit size in a cbuf.
+        std::string buffers;
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            const GPUVAddr descriptor{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset};
+            buffers += fmt::format(" sb{}:{:#x}+{:#x}", desc.is_written ? "w" : "",
+                                   gpu_memory.Read<u64>(descriptor), gpu_memory.Read<u32>(descriptor + 8));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NS2 dispatch resources (run {}, pipeline {:016x}, shader {:#x}, grid {}x{}x{}, block {}x{}x{}, shared {}):{}{} native {:016x}",
+                 ns2_traced_runs, shader_hash, kepler_compute.regs.code_loc.Address() + qmd.program_start,
+                 qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
+                 qmd.block_dim_x.Value(), qmd.block_dim_y.Value(), qmd.block_dim_z.Value(),
+                 qmd.shared_alloc.Value(), buffers.empty() ? std::string{" no storage buffers"} : buffers,
+                 described.empty() ? std::string{" no images"} : described, ns2_native_key);
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            if (desc.is_written) {
+                continue;
+            }
+            const GPUVAddr descriptor{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset};
+            LogSmallStorageBuffer(gpu_memory, buffer_cache, shader_hash, gpu_memory.Read<u64>(descriptor),
+                                  gpu_memory.Read<u32>(descriptor + 8));
+        }
+    }
+
+    // NS2 diagnostics (port of EdenNS2 main's b111 frame capture, extended in yoshi-int-build-33):
+    // the images Yoshi's DLSS reconstruction kernel reads and writes, before (and, for written
+    // images, after) its 1st, 2nd and 300th run (main captures run 300; runs 1 and 2 show who
+    // fills the 256x160 image first). At run 300 also its program memory, constant buffers and
+    // storage buffers, for offline re-execution. Main identifies the kernel by its pipeline hash
+    // a7e217052ec1940b (9952bd6443009b3c since b112); the lowered code differs here, so the native
+    // program key is used. Only reads: rendering is unchanged. Files go to
     // <log dir>/ns2_capture_yoshi-integration/ (main writes <log dir>/ns2_capture/).
-    if (ns2_native_key == NS2CaptureNativeKey && ++ns2_capture_runs == NS2CaptureRun) {
-        static std::atomic<bool> captured{false};
-        if (!captured.exchange(true)) {
+    const u32 capture_run = ns2_native_key == NS2CaptureNativeKey ? ++ns2_capture_runs : 0;
+    const int capture_slot = capture_run == 1 ? 0 : capture_run == 2 ? 1 : capture_run == NS2CaptureRun ? 2 : -1;
+    if (capture_slot >= 0) {
+        static std::array<std::atomic<bool>, 3> captured{};
+        if (!captured[static_cast<size_t>(capture_slot)].exchange(true)) {
             std::error_code ec;
             const auto dir = NS2CaptureDirectory();
             std::filesystem::create_directories(dir, ec);
-            {
-                std::ofstream info_file(dir / "capture_info.txt");
-                info_file << fmt::format(
-                    "emulator=EdenNS2 yoshi-integration\nbuild={} {}\nnative_key={:016x}\n"
-                    "pipeline_hash={:016x}\nrun={}\nmain_reference=log/ns2_capture/a7e217052ec1940b_run300_*\n",
-                    Common::g_scm_branch, Common::g_scm_desc, ns2_native_key, shader_hash,
-                    NS2CaptureRun);
-            }
+            const std::string prefix =
+                fmt::format("yoshi-integration_{:016x}_run{}_", ns2_native_key, capture_run);
+            std::ofstream info_file(dir / "capture_info.txt", std::ios::app);
+            info_file << fmt::format(
+                "emulator=EdenNS2 yoshi-integration\nbuild={} {}\nnative_key={:016x}\n"
+                "pipeline_hash={:016x}\nrun={}\nmain_reference=log/ns2_capture/9952bd6443009b3c_run300_*\n",
+                Common::g_scm_branch, Common::g_scm_desc, ns2_native_key, shader_hash, capture_run);
             size_t view_index = 0;
             u32 saved = 0;
             const auto capture = [&](size_t count, const char* kind, bool written) {
                 for (size_t i = 0; i < count && view_index < views.size(); ++i, ++view_index) {
                     const auto id = views[view_index].id;
-                    const std::string name =
-                        fmt::format("yoshi-integration_{:016x}_run{}_{}{}_{}", ns2_native_key, NS2CaptureRun,
-                                    kind, view_index, texture_cache.DescribeImageView(id));
+                    const std::string name = fmt::format("{}{}{}_{}", prefix, kind, view_index,
+                                                         texture_cache.DescribeImageView(id));
                     std::string file_name;
                     for (const char ch : name) {
                         file_name += (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_') ? ch : '-';
@@ -311,10 +444,57 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             for (const auto& desc : info.image_buffer_descriptors) capture(desc.count, "ib", desc.is_written);
             for (const auto& desc : info.texture_descriptors) capture(desc.count, "t", false);
             for (const auto& desc : info.image_descriptors) capture(desc.count, "i", desc.is_written);
+            if (capture_run == NS2CaptureRun) {
+                // Program memory from 0x200 before the program address (to include its header),
+                // up to 128 KiB or the first unmapped page.
+                const GPUVAddr program = kepler_compute.regs.code_loc.Address() + qmd.program_start;
+                const GPUVAddr program_from = program >= 0x200 ? program - 0x200 : program;
+                info_file << fmt::format(
+                    "program={:#x} code_loc={:#x} program_start={:#x} program_file_offset={:#x} "
+                    "program_bytes={:#x}\ngrid={}x{}x{} block={}x{}x{} shared={:#x} cbuf_enable_mask={:#x}\n",
+                    program, kepler_compute.regs.code_loc.Address(), qmd.program_start,
+                    program - program_from,
+                    NS2SaveGuestMemory(gpu_memory, program_from, 0x20000 + (program - program_from),
+                                       dir / (prefix + "program.bin")),
+                    qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
+                    qmd.block_dim_x.Value(), qmd.block_dim_y.Value(), qmd.block_dim_z.Value(),
+                    qmd.shared_alloc.Value(), qmd.const_buffer_enable_mask.Value());
+                for (size_t i = 0; i < cbufs.size(); ++i) {
+                    if (((qmd.const_buffer_enable_mask >> i) & 1) == 0) {
+                        continue;
+                    }
+                    const u64 bytes = NS2SaveGuestMemory(gpu_memory, cbufs[i].Address(), cbufs[i].size.Value(),
+                                                         dir / fmt::format("{}cbuf{}.bin", prefix, i));
+                    info_file << fmt::format("cbuf{}={:#x}+{:#x} saved={:#x}\n", i, cbufs[i].Address(),
+                                             cbufs[i].size.Value(), bytes);
+                }
+                // Storage buffers (descriptors: 64-bit address, 32-bit size in a cbuf), after
+                // downloading what the host GPU wrote to them; at most 16 MiB each.
+                size_t ssbo = 0;
+                for (const auto& desc : info.storage_buffers_descriptors) {
+                    const GPUVAddr descriptor{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset};
+                    const GPUVAddr address = gpu_memory.Read<u64>(descriptor);
+                    u64 size = gpu_memory.Read<u32>(descriptor + 8);
+                    if (size == 0) {
+                        size = gpu_memory.GetMemoryLayoutSize(address);
+                    }
+                    size = (std::min<u64>)(size, 16ULL << 20);
+                    if (const auto ssbo_device = gpu_memory.GpuToCpuAddress(address, size); ssbo_device && size != 0) {
+                        buffer_cache.DownloadMemory(*ssbo_device, size);
+                    }
+                    const u64 bytes = NS2SaveGuestMemory(
+                        gpu_memory, address, size,
+                        dir / fmt::format("{}sb{}{}.bin", prefix, ssbo, desc.is_written ? "w" : ""));
+                    info_file << fmt::format("sb{}{}=cbuf{}+{:#x} -> {:#x}+{:#x} saved={:#x}\n", ssbo,
+                                             desc.is_written ? "w" : "", desc.cbuf_index, desc.cbuf_offset,
+                                             address, size, bytes);
+                    ++ssbo;
+                }
+            }
             LOG_WARNING(Render_Vulkan,
                         "NS2 capture: native program {:016x} (pipeline {:016x}) run {}: saved {} images "
                         "before the dispatch to {}",
-                        ns2_native_key, shader_hash, NS2CaptureRun, saved, dir.string());
+                        ns2_native_key, shader_hash, capture_run, saved, dir.string());
         }
     }
 

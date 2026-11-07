@@ -77,6 +77,7 @@ private:
     u32 num_descriptor_entries{};
     u64 ns2_native_key{};  ///< NS2 diagnostics: NativeProgramKey of the native program.
     u32 ns2_capture_runs{}; ///< NS2 diagnostics: runs counted for the frame capture.
+    u32 ns2_traced_runs{};  ///< NS2 diagnostics: first runs whose resources were logged.
     /// NS2 diagnostics: written images to save after the capture run's dispatch.
     std::vector<std::pair<VideoCommon::ImageViewId, std::string>> ns2_capture_after;
 
