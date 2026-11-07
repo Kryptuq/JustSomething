@@ -401,3 +401,33 @@ all five (its b123 log has the same program keys and sizes). Four separate commi
 Offline result: all five programs lower and translate to valid SPIR-V (spirv-val, Vulkan 1.3).
 Not runtime-tested yet. The other ten rejected programs in the dump are partly written shader
 memory (main never sees them); that is a separate open problem, as is the gameplay flicker.
+
+## yoshi-int-build-32: reconstruction capture (diagnostics) and LDSM fix
+- D1 (diagnostics only): main's b111 frame capture of the DLSS reconstruction kernel
+  (native 85237f4449a5ebe7), identified by its native key, run 300, written to
+  `log/ns2_capture_yoshi-integration/`.
+- F1: LDSM whose address register lies inside its destination (557f7bdab63f0cb8 +0x25e0): the
+  address is now kept in a scratch register no matrix load overwrites. Test: ampere_ldsm.cpp
+  (32-lane interpreter against ldmatrix).
+Results (user, with main build 123 captured on the same route): the reconstruction inputs
+(colour, motion, depth, exposure) are equivalent and sharp in both builds; this build's output is
+ghosted, main's is clean. The history weight the kernel writes is ~1/64 here and ~1/3 on main, and
+the 256x160 image it reads holds completely different data. Flicker: draws using vertex programs
+0x1b147ced00 / 0x1b147d1400 are skipped; the memory at those addresses keeps changing between
+code and other data, with no end of program in it.
+
+## yoshi-int-build-33: diagnostics for the reconstruction inputs and the program address origin
+Two separate commits, diagnostics only (no rendering or behaviour change):
+- D2: main's "NS2 dispatch resources" and "NS2 storage buffer ... read by pipeline" log lines for
+  the first three runs of every native compute pipeline, in main's format (native key appended),
+  to compare the DLSS network output with main build 123. The reconstruction capture now also
+  covers runs 1 and 2, and at run 300 saves the kernel's program memory, constant buffers and
+  storage buffers (`*_program.bin`, `*_cbufN.bin`, `*_sbN.bin`, listed in capture_info.txt). Like
+  main, the storage buffer log downloads what the host GPU wrote to those buffers first.
+- D3: for every rejected native graphics program (8 per address, 64 in all), "NS2 address origin"
+  lines: the macro call that stored the stage's program address (parameters, where they were read
+  from and whether they still hold them, registers it read), the slot's earlier stores, whether a
+  program was ever built at that address, copies/uploads into its memory, GPU-written pages and
+  the latest MME DMA reads; the MME data RAM and macro code go to
+  `log/ns2_macro_yoshi-integration/` for offline replay. Test: [ns2-trace].
+All these files are game data: keep them local, never commit them.
