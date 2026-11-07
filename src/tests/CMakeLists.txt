@@ -33,6 +33,7 @@ add_executable(tests
     video_core/ampere_ports.cpp
     video_core/ampere_register_remap.cpp
     video_core/ampere_uniform_carry.cpp
+    video_core/ns2_program_address_trace.cpp
     video_core/ns2_rejected_dump.cpp
     video_core/ns2_raw_surface.cpp
     video_core/native_macro_fifo.cpp

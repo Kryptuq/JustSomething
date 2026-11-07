@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -17,6 +19,8 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
+#include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/ns2_rejection_trace.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
@@ -27,6 +31,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/ns2_program_address_trace.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
@@ -103,6 +108,115 @@ std::string DescribeAddressWrite(Tegra::MemoryManager& gpu_memory, size_t stage,
         text += "; no register store of this value seen";
     }
     return text;
+}
+
+// Diagnostics only (yoshi-int-build-33): where a rejected native program's address came from.
+// For the value stored in each half of the stage's program address: the macro call that stored it
+// (parameters, the GPU address and copy they were read from, whether those words still hold them,
+// the registers the macro read), the slot's earlier stores, whether a program was ever built at
+// this address, the copy-engine copies and inline uploads into the program's memory, its
+// GPU-written pages and the latest MME DMA reads. The engine's MME data RAM at the store and the
+// macro code are written to <log dir>/ns2_macro_yoshi-integration/ for offline replay.
+void ReportProgramAddressOrigin(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+                                size_t stage, GPUVAddr program, u32 high, u32 low) {
+    namespace Trace = VideoCommon::NS2ProgramAddressTrace;
+    static u32 report_number = 0;
+    const u32 number = ++report_number;
+    const auto now = Trace::Clock::now();
+    const auto ago = [&](Trace::Clock::time_point time) {
+        return std::chrono::duration<double, std::milli>(now - time).count();
+    };
+    const auto built = Trace::FindBuilt(program);
+    LOG_INFO(HW_GPU, "NS2 address origin #{}: program {:#x} stage {} (high {:#x}, low {:#x}); {}", number,
+             program, stage, high, low,
+             built ? fmt::format("a program was built at this address {} times, last {:.1f} ms ago (hash {:016x})",
+                                 built->count, ago(built->time), built->hash)
+                   : std::string{"no program was ever built at this address"});
+    for (const bool is_high : {true, false}) {
+        const u32 value = is_high ? high : low;
+        const auto history = Trace::StoredHistory(stage, is_high);
+        std::string earlier;
+        bool detailed = false;
+        for (const auto& write : history) {
+            if (write.value != value || detailed) {
+                earlier += fmt::format(" {:#x}@{:.1f}ms{}", write.value, ago(write.time),
+                                       write.macro ? fmt::format("(m{:#x})", write.macro) : std::string{});
+                continue;
+            }
+            detailed = true;
+            std::string reads;
+            for (u32 i = 0; i < write.read_count; ++i) {
+                reads += fmt::format(" r{:#x}={:#x}", write.reads[i].method, write.reads[i].value);
+            }
+            std::string params_now = "not checked";
+            if (write.param_address != 0 && write.param_count != 0) {
+                std::array<u32, 32> live{};
+                gpu_memory.ReadBlockUnsafe(write.param_address, live.data(), write.param_count * sizeof(u32));
+                params_now = std::equal(live.begin(), live.begin() + write.param_count, write.params.begin())
+                                 ? "same"
+                                 : fmt::format("CHANGED: {:08x}",
+                                               fmt::join(std::span{live}.first(write.param_count), " "));
+            }
+            LOG_INFO(HW_GPU,
+                     "NS2 address origin #{}: {} {:#x} stored {:.1f} ms ago by {}; {} parameters {:08x} read "
+                     "from {:#x} ({}), those words now: {}; registers read:{}",
+                     number, is_high ? "high" : "low", value, ago(write.time),
+                     write.macro ? fmt::format("macro {:#x}", write.macro) : std::string{"a direct method"},
+                     write.param_count, fmt::join(std::span{write.params}.first(write.param_count), " "),
+                     write.param_address, write.param_source ? write.param_source : "?", params_now,
+                     reads.empty() ? std::string{" none (or a memoized call)"} : reads);
+        }
+        LOG_INFO(HW_GPU, "NS2 address origin #{}: {} stores of this slot, newest first:{}{}", number,
+                 is_high ? "high" : "low", earlier.empty() ? std::string{" none other"} : earlier,
+                 detailed ? "" : " (the current value is NOT among the remembered stores)");
+    }
+    // Who wrote the program's memory (0x16000 bytes from the address).
+    constexpr u64 Range = 0x16000;
+    std::string writers;
+    u32 shown = 0;
+    for (const auto& write : Trace::WritesOverlapping(program, Range)) {
+        if (++shown > 12) break;
+        writers += fmt::format(" [{} {:#x}+{:#x} from {:#x}{} {:.1f}ms ago]", write.kind, write.destination,
+                               write.size, write.source, write.source_gpu ? " (GPU-written source)" : "",
+                               ago(write.time));
+    }
+    u32 gpu_pages = 0, pages = 0;
+    for (GPUVAddr page = program & ~GPUVAddr{0xfff}; page < program + Range; page += 0x1000, ++pages) {
+        if (const auto device = gpu_memory.GpuToCpuAddress(page); device && Tegra::Nx2IsGpuWritten(*device)) {
+            ++gpu_pages;
+        }
+    }
+    LOG_INFO(HW_GPU, "NS2 address origin #{}: memory {:#x}+{:#x}: {} of {} pages GPU-written; copies/uploads "
+             "into it (of the last 1024):{}",
+             number, program, Range, gpu_pages, pages, writers.empty() ? std::string{" none"} : writers);
+    std::string dma;
+    shown = 0;
+    for (const auto& read : Trace::DmaReads()) {
+        if (++shown > 8) break;
+        dma += fmt::format(" [m{:#x} {:#x} -> {} {:#x} x{}{} {:08x} {:.1f}ms ago]", read.macro, read.source,
+                           read.fifoed ? "fifo" : "ram", read.ram, read.count, read.flushed ? " flushed" : "",
+                           fmt::join(read.words, " "), ago(read.time));
+    }
+    LOG_INFO(HW_GPU, "NS2 address origin #{}: latest MME DMA reads:{}", number,
+             dma.empty() ? std::string{" none"} : dma);
+    // Data RAM at the low word's store, and (once) the macro code, for offline replay.
+    std::error_code ec;
+    const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_macro_yoshi-integration";
+    std::filesystem::create_directories(dir, ec);
+    for (const bool is_high : {true, false}) {
+        const auto data_ram = Trace::DataRamAtStore(stage, is_high);
+        std::ofstream file(dir / fmt::format("{:03}_{:x}_stage{}_{}_dataram.bin", number, program, stage,
+                                             is_high ? "high" : "low"),
+                           std::ios::binary);
+        file.write(reinterpret_cast<const char*>(data_ram.data()), sizeof(data_ram));
+    }
+    static bool code_saved = false;
+    if (!code_saved) {
+        code_saved = true;
+        const auto& code = maxwell3d.GetNativeMacroEngine().native_code;
+        std::ofstream file(dir / "macro_code.bin", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(code.data()), sizeof(code));
+    }
 }
 } // Anonymous namespace
 
@@ -207,6 +321,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
                 Common::NS2RejectionTrace::OnBuilt(*cpu_shader_addr);
+                if (native) {
+                    VideoCommon::NS2ProgramAddressTrace::NoteBuilt(shader_addr, shader_info->unique_hash);
+                }
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
@@ -225,6 +342,12 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                              DescribeAddressWrite(*gpu_memory, index, true, shader_config.reserved[0]),
                              DescribeAddressWrite(*gpu_memory, index, false, shader_config.reserved[1]),
                              DescribeProgramMemory(*gpu_memory, device_memory, shader_addr));
+                }
+                // Diagnostics only (yint-33): every rejection of a program (up to 8 per address,
+                // 64 in all), since the memory behind the hot addresses keeps changing.
+                if (native && VideoCommon::NS2ProgramAddressTrace::TakeReport(shader_addr, 8, 64)) {
+                    ReportProgramAddressOrigin(*maxwell3d, *gpu_memory, index, shader_addr,
+                                               shader_config.reserved[0], shader_config.reserved[1]);
                 }
                 throw;
             }

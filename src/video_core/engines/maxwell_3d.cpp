@@ -354,7 +354,8 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         draw_manager.DrawDeferred(*this, true);
     }
     regs.reg_array[method] = argument;
-    VideoCommon::NS2ProgramAddressTrace::NoteStored(method, argument, current_dma_segment);
+    VideoCommon::NS2ProgramAddressTrace::NoteStored(method, argument, current_dma_segment,
+                                                    &native_data_ram);
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
 }
@@ -457,7 +458,8 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
 
     // Execute the current macro.
-    const VideoCommon::NS2ProgramAddressTrace::MacroScope trace_macro{method};
+    const VideoCommon::NS2ProgramAddressTrace::MacroScope trace_macro{
+        method, parameters, macro_segments.empty() ? GPUVAddr{0} : macro_segments.front().first};
     GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
     draw_manager.DrawDeferred(*this);
 }

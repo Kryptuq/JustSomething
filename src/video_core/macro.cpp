@@ -30,6 +30,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/memory_manager.h"
+#include "video_core/ns2_program_address_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
 
@@ -1432,7 +1433,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                             }
                         }
                     }
-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                    const bool ns2_flushed =
+                        memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                    if (ns2_flushed) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
                         if (++flushes % 2000 == 1) {
@@ -1446,6 +1449,14 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);
                         LOG_INFO(HW_GPU, "Native MME DMA read{} start={:#x} source={:#x} count={} words={:08x}",
                                  address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
+                    }
+                    {
+                        // Diagnostics only (yint-33): where macro data comes from.
+                        std::array<u32, 4> first{};
+                        for (u32 i = 0; i < std::min<u32>(value, 4); ++i) first[i] = memory.Read<u32>(source + u64{i} * 4);
+                        VideoCommon::NS2ProgramAddressTrace::NoteMmeDmaRead(
+                            source, ram, value, address == DmaReadFifoed, ns2_flushed,
+                            std::span<const u32>{first.data(), std::min<u32>(value, 4)});
                     }
                     for (u32 i = 0; i < std::min<u32>(value, 0x1000); ++i) {
                         const u32 word = memory.Read<u32>(source + u64{i} * 4);
@@ -1479,7 +1490,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             const auto result = native_jit->Execute(
                 method, fifo, std::span<u32>{*native_interpreter.active_dram},
                 [&](u32 address) {
-                    return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+                    const u32 value = address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+                    VideoCommon::NS2ProgramAddressTrace::NoteMacroRead(address, value);
+                    return value;
                 },
                 emit);
             if (!result.success) {
@@ -1525,7 +1538,11 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         fifo.assign(parameters.begin(), parameters.end());
         const u64 code_generation = native_code_generation;
         const auto result = native_interpreter.Execute(native_code, method, fifo,
-            [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
+            [&](u32 address) {
+                const u32 value = address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+                VideoCommon::NS2ProgramAddressTrace::NoteMacroRead(address, value);
+                return value;
+            },
             [&](u32 address, u32 value) {
                 if (use_memo) {
                     native_writes.emplace_back(address, value);

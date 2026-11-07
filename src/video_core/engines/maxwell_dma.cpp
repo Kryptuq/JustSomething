@@ -15,6 +15,8 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/ns2_program_address_trace.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -64,6 +66,16 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 
 void MaxwellDMA::Launch() {
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
+    // Diagnostics only (yint-33): copies into GPU memory, to tell who writes the memory a rejected
+    // native program address points at.
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        const u64 lines = regs.launch_dma.multi_line_enable ? (std::max<u64>)(regs.line_count, 1) : 1;
+        const u64 pitch = static_cast<u64>(regs.pitch_out < 0 ? -s64{regs.pitch_out} : s64{regs.pitch_out});
+        const auto source = memory_manager.GpuToCpuAddress(static_cast<GPUVAddr>(regs.offset_in));
+        VideoCommon::NS2ProgramAddressTrace::NoteMemoryWrite(
+            "copy engine", GPUVAddr(regs.offset_out), (lines - 1) * pitch + regs.line_length_in,
+            static_cast<GPUVAddr>(regs.offset_in), source && Tegra::Nx2IsGpuWritten(*source));
+    }
     // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
     static const u64 trace_destination = [] {
         const char* value = std::getenv("EDEN_NX2_TRACE_DST");
