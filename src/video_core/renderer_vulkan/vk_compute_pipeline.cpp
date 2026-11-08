@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -32,6 +34,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "common/cityhash.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
@@ -168,6 +171,63 @@ namespace {
 // run main's capture defaults to.
 constexpr u64 NS2CaptureNativeKey = 0x85237f4449a5ebe7ULL;
 constexpr u32 NS2CaptureRun = 300;
+// NS2 diagnostics (yoshi-int-build-34, D5): the DLSS network kernels that run before the
+// reconstruction kernel in each frame (input preparation, then the layers up to the output it
+// reads), captured at their run 300 (the same frame as the reconstruction capture).
+constexpr std::array<u64, 11> NS2NetworkKeys{
+    0xd0fd7371b026dfe6ULL, 0x557f7bdab63f0cb8ULL, 0x445c38e434e886a7ULL, 0xe3241724f8369e6aULL,
+    0xe5e364e5391aeedcULL, 0xe257f54802774cb3ULL, 0xbe594fabcdb19f53ULL, 0xfb88b1bef8a89c12ULL,
+    0x048a27befe2d33faULL, 0x7854e7fc4e9dac27ULL, 0x7a06618494a29bcdULL};
+
+std::filesystem::path NS2NetworkDirectory() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_network_yoshi-integration";
+}
+
+// Saves guest memory [address, address + size) as 64 KiB chunks named by their content hash (equal
+// chunks are written once, so unchanged memory costs nothing across snapshots), after downloading
+// what the host GPU wrote there. Returns "base=<first chunk address> chunks=<hash>,...".
+// With `host`, the chunks hold what the host buffers hold there instead (read without changing
+// any tracking, so data the GPU wrote outside a binding's range shows up too).
+std::string NS2SaveChunks(Tegra::MemoryManager& gpu_memory, BufferCache& buffer_cache,
+                          GPUVAddr address, u64 size, bool host = false) {
+    constexpr u64 Chunk = 0x10000;
+    static std::mutex mutex;
+    static std::unordered_set<u64> written;
+    std::scoped_lock lock{mutex};
+    const auto dir = NS2NetworkDirectory() / "chunks";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const GPUVAddr first = address & ~(Chunk - 1);
+    std::string hashes;
+    std::vector<u8> bytes(Chunk);
+    for (GPUVAddr chunk = first; chunk < address + size; chunk += Chunk) {
+        std::fill(bytes.begin(), bytes.end(), u8{0});
+        const auto contiguous = host ? gpu_memory.GpuToCpuAddress(chunk, Chunk) : std::nullopt;
+        if (contiguous) {
+            // One staging read per chunk (each read waits for the GPU).
+            gpu_memory.ReadBlockUnsafe(chunk, bytes.data(), Chunk);
+            (void)buffer_cache.NS2ReadHostRange(*contiguous, bytes);
+        }
+        for (GPUVAddr page = chunk; !contiguous && page < chunk + Chunk; page += 0x1000) {
+            if (const auto device = gpu_memory.GpuToCpuAddress(page)) {
+                if (host) {
+                    gpu_memory.ReadBlockUnsafe(page, bytes.data() + (page - chunk), 0x1000);
+                    (void)buffer_cache.NS2ReadHostRange(*device, std::span<u8>{bytes.data() + (page - chunk), 0x1000});
+                } else {
+                    buffer_cache.DownloadMemory(*device, 0x1000);
+                    gpu_memory.ReadBlockUnsafe(page, bytes.data() + (page - chunk), 0x1000);
+                }
+            }
+        }
+        const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        if (written.insert(hash).second) {
+            std::ofstream file(dir / fmt::format("{:016x}.bin", hash), std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        }
+        hashes += fmt::format("{}{:016x}", hashes.empty() ? "" : ",", hash);
+    }
+    return fmt::format("base={:#x} chunks={}", first, hashes);
+}
 
 std::filesystem::path NS2CaptureDirectory() {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_capture_yoshi-integration";
@@ -257,12 +317,25 @@ u64 NS2SaveGuestMemory(Tegra::MemoryManager& gpu_memory, GPUVAddr address, u64 s
 } // Anonymous namespace
 
 void ComputePipeline::NS2CaptureAfterDispatch(TextureCache& texture_cache) {
-    if (ns2_capture_after.empty()) {
+    if (ns2_capture_after.empty() && ns2_capture_manifest.empty()) {
         return;
     }
     u32 saved = 0;
+    const auto directory = ns2_capture_manifest.empty() ? NS2CaptureDirectory() : NS2NetworkDirectory();
     for (const auto& [id, file_name] : ns2_capture_after) {
-        saved += texture_cache.NS2CaptureImageView(id, NS2CaptureDirectory() / file_name) ? 1 : 0;
+        saved += texture_cache.NS2CaptureImageView(id, directory / file_name) ? 1 : 0;
+    }
+    // D5: written storage buffers after the dispatch (the downloads wait for the GPU).
+    if (!ns2_capture_manifest.empty() && ns2_gpu_memory != nullptr && ns2_buffer_cache != nullptr) {
+        std::ofstream manifest(ns2_capture_manifest, std::ios::app);
+        for (const auto& [address, size] : ns2_capture_after_buffers) {
+            manifest << fmt::format("after_host address={:#x} size={:#x} {}\n", address, size,
+                                    NS2SaveChunks(*ns2_gpu_memory, *ns2_buffer_cache, address, size, true));
+            manifest << fmt::format("after address={:#x} size={:#x} {}\n", address, size,
+                                    NS2SaveChunks(*ns2_gpu_memory, *ns2_buffer_cache, address, size));
+        }
+        ns2_capture_after_buffers.clear();
+        ns2_capture_manifest.clear();
     }
     LOG_WARNING(Render_Vulkan, "NS2 capture: native program {:016x}: saved {} written images after the dispatch",
                 ns2_native_key, saved);
@@ -445,10 +518,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             for (const auto& desc : info.texture_descriptors) capture(desc.count, "t", false);
             for (const auto& desc : info.image_descriptors) capture(desc.count, "i", desc.is_written);
             if (capture_run == NS2CaptureRun) {
-                // Program memory from 0x200 before the program address (to include its header),
-                // up to 128 KiB or the first unmapped page.
+                // Program memory from the program address, up to 128 KiB or the first unmapped
+                // page (yint-33 started 0x200 earlier and stopped at once on an unmapped page).
                 const GPUVAddr program = kepler_compute.regs.code_loc.Address() + qmd.program_start;
-                const GPUVAddr program_from = program >= 0x200 ? program - 0x200 : program;
+                const GPUVAddr program_from = program;
                 info_file << fmt::format(
                     "program={:#x} code_loc={:#x} program_start={:#x} program_file_offset={:#x} "
                     "program_bytes={:#x}\ngrid={}x{}x{} block={}x{}x{} shared={:#x} cbuf_enable_mask={:#x}\n",
@@ -496,6 +569,76 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                         "before the dispatch to {}",
                         ns2_native_key, shader_hash, capture_run, saved, dir.string());
         }
+    }
+
+    // NS2 diagnostics (yoshi-int-build-34, D5): the DLSS network kernels' program, constant
+    // buffers, storage buffers (the range the buffer cache binds, and up to 8 MiB from the address
+    // as an unbounded binding would see) and images, before the dispatch; written storage buffers
+    // and images again after it. Files: <log dir>/ns2_network_yoshi-integration/<key>_run300.txt
+    // (manifest) and chunks/. Reads only (plus downloads of GPU-written data).
+    if (std::ranges::find(NS2NetworkKeys, ns2_native_key) != NS2NetworkKeys.end() &&
+        ++ns2_capture_runs == NS2CaptureRun) {
+        std::error_code ec;
+        const auto dir = NS2NetworkDirectory();
+        std::filesystem::create_directories(dir, ec);
+        ns2_capture_manifest = (dir / fmt::format("{:016x}_run{}.txt", ns2_native_key, NS2CaptureRun)).string();
+        std::ofstream manifest(ns2_capture_manifest);
+        const GPUVAddr program = kepler_compute.regs.code_loc.Address() + qmd.program_start;
+        manifest << fmt::format(
+            "emulator=EdenNS2 yoshi-integration\nbuild={} {}\nnative_key={:016x}\npipeline_hash={:016x}\n"
+            "run={}\ngrid={}x{}x{}\nblock={}x{}x{}\nshared={:#x}\nprogram={:#x} program_bytes={:#x}\n",
+            Common::g_scm_branch, Common::g_scm_desc, ns2_native_key, shader_hash, NS2CaptureRun,
+            qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), qmd.block_dim_x.Value(),
+            qmd.block_dim_y.Value(), qmd.block_dim_z.Value(), qmd.shared_alloc.Value(), program,
+            NS2SaveGuestMemory(gpu_memory, program, 0x20000,
+                               dir / fmt::format("{:016x}_program.bin", ns2_native_key)));
+        for (size_t i = 0; i < cbufs.size(); ++i) {
+            if (((qmd.const_buffer_enable_mask >> i) & 1) != 0) {
+                manifest << fmt::format("cbuf{} addr={:#x} size={:#x} {}\n", i, cbufs[i].Address(),
+                                        cbufs[i].size.Value(),
+                                        NS2SaveChunks(gpu_memory, buffer_cache, cbufs[i].Address(),
+                                                      cbufs[i].size.Value()));
+            }
+        }
+        size_t ssbo = 0;
+        ns2_capture_after_buffers.clear();
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            const GPUVAddr descriptor{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset};
+            const GPUVAddr address = gpu_memory.Read<u64>(descriptor);
+            const u64 next_qword = gpu_memory.Read<u64>(descriptor + 8);
+            const auto [bound_address, bound_size] = buffer_cache.NS2StorageBindingRange(descriptor, desc.is_written);
+            const u64 extended = address == 0 ? 0 : (std::min<u64>)(gpu_memory.GetMemoryLayoutSize(address), 8ULL << 20);
+            manifest << fmt::format(
+                "sb{} written={} cbuf{}+{:#x} address={:#x} next_qword={:#x} bound={:#x}+{:#x} extended={:#x} before {}\n",
+                ssbo, desc.is_written, desc.cbuf_index, desc.cbuf_offset, address, next_qword, bound_address,
+                bound_size, extended,
+                extended == 0 ? std::string{"none"} : NS2SaveChunks(gpu_memory, buffer_cache, address, extended));
+            if (desc.is_written && extended != 0) {
+                ns2_capture_after_buffers.emplace_back(address, extended);
+            }
+            ++ssbo;
+        }
+        size_t view_index = 0;
+        const auto capture = [&](size_t count, const char* kind, bool written) {
+            for (size_t i = 0; i < count && view_index < views.size(); ++i, ++view_index) {
+                const auto id = views[view_index].id;
+                const std::string file_name = fmt::format("{:016x}_{}{}", ns2_native_key, kind, view_index);
+                const bool saved = texture_cache.NS2CaptureImageView(id, dir / (file_name + "_before.ns2img"));
+                manifest << fmt::format("view{} {} {} saved={}\n", view_index, kind,
+                                        texture_cache.DescribeImageView(id), saved);
+                if (written) {
+                    ns2_capture_after.emplace_back(id, file_name + "_after.ns2img");
+                }
+            }
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) capture(desc.count, "tb", false);
+        for (const auto& desc : info.image_buffer_descriptors) capture(desc.count, "ib", desc.is_written);
+        for (const auto& desc : info.texture_descriptors) capture(desc.count, "t", false);
+        for (const auto& desc : info.image_descriptors) capture(desc.count, "i", desc.is_written);
+        ns2_gpu_memory = &gpu_memory;
+        ns2_buffer_cache = &buffer_cache;
+        LOG_WARNING(Render_Vulkan, "NS2 network capture: native program {:016x} run {} saved to {}",
+                    ns2_native_key, NS2CaptureRun, ns2_capture_manifest);
     }
 
     buffer_cache.UnbindComputeTextureBuffers();

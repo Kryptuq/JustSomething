@@ -80,6 +80,11 @@ private:
     u32 ns2_traced_runs{};  ///< NS2 diagnostics: first runs whose resources were logged.
     /// NS2 diagnostics: written images to save after the capture run's dispatch.
     std::vector<std::pair<VideoCommon::ImageViewId, std::string>> ns2_capture_after;
+    /// NS2 diagnostics (D5): written storage buffer ranges saved after the dispatch, and where.
+    std::vector<std::pair<GPUVAddr, u64>> ns2_capture_after_buffers;
+    std::string ns2_capture_manifest;
+    Tegra::MemoryManager* ns2_gpu_memory{};
+    BufferCache* ns2_buffer_cache{};
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 

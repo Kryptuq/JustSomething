@@ -360,6 +360,16 @@ public:
     /// what the host buffers and guest memory hold there. Reads the host buffers through a staging
     /// copy without changing any tracking state; waits for the GPU.
     [[nodiscard]] std::string NS2DescribeRange(DAddr addr, u64 size);
+    /// Diagnostics only: copies what the host buffers hold at [addr, addr + out.size()) into
+    /// `out` (parts without a buffer stay as they are) without changing any tracking state; waits
+    /// for the GPU. Returns the buffers it read.
+    std::string NS2ReadHostRange(DAddr addr, std::span<u8> out);
+
+    /// Diagnostics only (yoshi-int-build-34, D5): the GPU range a storage buffer descriptor binds.
+    [[nodiscard]] std::pair<GPUVAddr, u32> NS2StorageBindingRange(GPUVAddr ssbo_addr, bool is_written) const {
+        const Binding binding = StorageBufferBinding(ssbo_addr, 0, is_written);
+        return {binding.gpu_addr, binding.size};
+    }
 
     /// Return true when a CPU region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(DAddr addr, size_t size);
