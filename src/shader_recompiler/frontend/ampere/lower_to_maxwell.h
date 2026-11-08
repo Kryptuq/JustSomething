@@ -3427,11 +3427,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0xfae: { // LDGSTS: global -> shared copy, done synchronously.
             // Bits 16-23 shared address, 24-31 global address pair (plus the uniform pair at bits
-            // 64-69, as for LDG), 44-63 shared offset, 73-75 size; when the predicate at 87-89
-            // (negated by 90) holds the source is ignored and zeros are stored.
+            // 64-69, as for LDG), 44-63 shared offset, 73-75 size. The predicate at 87-89 (negated
+            // by 90) ENABLES the copy: when it is false the source is not read and zeros are stored
+            // (cp.async with a source size of 0). Title 4's network kernel 557f7bdab63f0cb8 sets it
+            // to "row and column in bounds"; the same reading as Eglantine (78743f3) and Lichii
+            // (281477e).
             const u32 shared = insn.Bits(16, 8), global = insn.Bits(24, 8), size = insn.Bits(73, 3);
             const u32 uniform_address = uniform_register(insn.Bits(64, 6));
-            const u32 ignore = insn.Bits(87, 3) | (insn.Bits(90, 1) << 3);
+            const u32 enable = insn.Bits(87, 3) | (insn.Bits(90, 1) << 3);
             const u32 count = size == 6 ? 4U : size == 5 ? 2U : 1U;
             const u32 limit = uses_uniform_bank ? 216U : 250U;
             if (native_predicate != 7 || (insn.words[2] & ~(0x3fU | 0xe00U | 0x7ff000U | 0x07800000U)) != 0x08000140U ||
@@ -3444,13 +3447,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(0x5c10000000000000ULL | predicate | 247 | (u64{global + 1} << 8) | (u64{uniform_address + 1} << 20) | (u64{1} << 43));
                 address = 246;
             }
-            if (ignore != 15) {
-                // ignore == 7 (PT) zero-fills unconditionally; otherwise load under !P and zero under P.
-                if (ignore != 7)
-                    emit(0xeed0000000000000ULL | (u64{ignore ^ 8U} << 16) | 248 | (u64{address} << 8) |
+            if (enable != 7) {
+                // Load under P and store zeros under !P; enable == 15 (!PT) only stores zeros.
+                if (enable != 15)
+                    emit(0xeed0000000000000ULL | (u64{enable} << 16) | 248 | (u64{address} << 8) |
                          (u64{1} << 45) | (u64{size} << 48));
                 for (u32 k = 0; k < count; ++k)
-                    emit(0x5c98000000000000ULL | (u64{ignore} << 16) | (248 + k) | (u64{255} << 20) | (u64{15} << 39));
+                    emit(0x5c98000000000000ULL | (u64{enable ^ 8U} << 16) | (248 + k) | (u64{255} << 20) | (u64{15} << 39));
             } else {
                 emit(0xeed0000000000000ULL | predicate | 248 | (u64{address} << 8) | (u64{1} << 45) | (u64{size} << 48));
             }
