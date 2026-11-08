@@ -431,3 +431,22 @@ Two separate commits, diagnostics only (no rendering or behaviour change):
   the latest MME DMA reads; the MME data RAM and macro code go to
   `log/ns2_macro_yoshi-integration/` for offline replay. Test: [ns2-trace].
 All these files are game data: keep them local, never commit them.
+
+## yoshi-int-build-34: diagnostics D4 (zeroed vertex programs) and D5 (DLSS network)
+yoshi-int-build-33 results: the reconstruction kernel's translation is correct (run offline on
+the captured inputs it reproduces the GPU's output, and EdenNS2 main's translation gives identical
+results); its history weight is driven by the DLSS network output. Main's network reads several of
+its buffers from invalid addresses, so main is no reference for it. The rejected gameplay vertex
+programs come straight from the game's command lists; their memory reads as zero although the
+buffer cache marked it GPU-written.
+Two separate commits, diagnostics only:
+- D4: a ring of buffer cache events (GPU writes with fence download or read trap, copies, CPU
+  writes and clears, flush and fence downloads, uploads to host buffers); each rejected native
+  program's report adds the texture/buffer cache state of its first 4 KiB, what the host buffer and
+  guest memory hold there, what a flush downloads, the state after it, and the events on its memory.
+  Test: [ns2-events].
+- D5: the 11 network kernels' program, constant buffers, storage buffers (bound range and up to
+  8 MiB) and images before, and written buffers/images after their run 300, as content-addressed
+  chunks with a manifest per kernel in `log/ns2_network_yoshi-integration/`. The reconstruction
+  capture now saves its program from the program address.
+All these files are game data: keep them local, never commit them.
