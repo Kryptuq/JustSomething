@@ -460,3 +460,18 @@ and the same translation writes them offline; binding sizes are not involved.
 - Fix: AsyncBufferDownloads() is true for Switch 2 titles again (as in EdenNS2 main); read traps
   remain in the code but no longer arm. EDEN_NX2_BUFFER_DOWNLOADS=0 restores the old behaviour.
 - The D4/D5 diagnostics stay in this build to compare with yoshi-int-build-34.
+
+## yoshi-int-build-36: LDGSTS predicate fix + Book capture (diagnostics)
+yoshi-int-build-35 results: flicker gone; red/yellow still ghosted; the Book page renders near-black
+(main build-123 renders it). Offline, a reference interpreter of the native 557f program (32-lane
+warps, 48 KiB shared memory) reproduces the GPU's build-35 output when LDGSTS is executed as this
+branch lowered it. The output is 8-bit (f16 bits 14..7), not f16, and the same for every pixel:
+the first layer's result is ReLU(bias), so its weights contributed nothing. Executed both ways, the
+first difference is at the first LDGSTS.
+- Fix (90826d30): LDGSTS's predicate (bits 87-89, negated by bit 90) enables the copy; zeros are
+  stored when it is false. The lowering had it inverted, so 557f zero-filled its valid weights.
+  Same reading as Eglantine and Lichii. Test: ampere_async_copy.cpp (adapted from Lichii's).
+- Diagnostics (8fceca80): Tools > Capture Screenshot (Ctrl+P) captures the next frame once per
+  session: each draw/dispatch, its render targets, texture descriptors (raw TIC words) and the
+  images they resolved to, saved as host copy (.ns2img) and game-memory bytes (.guest), plus the
+  images the frame wrote, skipped draws, uploads and blits. <log dir>/ns2_book_capture_yoshi-integration/.
