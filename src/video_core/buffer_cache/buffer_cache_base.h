@@ -584,11 +584,12 @@ private:
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
     /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
-    /// Not for Switch 2 titles: title 1 had 250-330 MB/s copied back (a fence per compute
-    /// dispatch, the fencing thread holding the buffer cache while it wrote them), while its CPU
-    /// read GPU-written memory at most 64 times in 200 s (counted with reactive flushing) and
-    /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
-    /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
+    /// Switch 2 titles too (yoshi-int-build-35): without fence downloads a GPU-written range
+    /// stays marked until something flushes it, and a guest CPU write to such a page is kept as
+    /// a cached write without clearing the mark, so the next flush copied the stale host bytes
+    /// over the CPU's newer data (Yoshi's CPU-written shader code: zero holes and 0xff tails,
+    /// rejected programs, flicker). Skipping them made a fence cost ~1 us instead of ~5 and draw
+    /// setup ~7% less in title 1. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
     bool AsyncBufferDownloads() const {
         static const int forced = [] {
             const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
@@ -597,7 +598,7 @@ private:
         if (forced >= 0) {
             return forced == 1;
         }
-        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
+        return true;
     }
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
