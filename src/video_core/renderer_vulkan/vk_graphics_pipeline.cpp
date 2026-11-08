@@ -34,6 +34,7 @@
 #include "common/settings.h"
 #include "video_core/nx2_profile.h"
 #include "common/ns2_frame_trace.h"
+#include "video_core/ns2_book_capture.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -808,6 +809,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(
             std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
+    }
+    if (VideoCommon::NS2BookCapture::Active()) [[unlikely]] {
+        // NS2 Book capture (diagnostics): render targets and textures of this draw. Stage program
+        // hashes in Maxwell stage order (VertexA, VertexB, TessCtrl, TessEval, Geometry, Fragment).
+        const auto& h = key.unique_hashes;
+        texture_cache.NS2BookCaptureViews(
+            fmt::format("graphics stages {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} built={}", h[0], h[1],
+                        h[2], h[3], h[4], h[5], IsBuilt() && pipeline ? 1 : IsBuilt() ? 0 : 2),
+            std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()}, false);
     }
     if (IsBuilt() && !pipeline) {
         return false;

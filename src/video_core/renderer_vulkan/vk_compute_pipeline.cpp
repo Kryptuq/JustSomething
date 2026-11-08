@@ -38,6 +38,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
+#include "video_core/ns2_book_capture.h"
 #include "common/settings.h"
 
 namespace Vulkan {
@@ -426,6 +427,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+    if (VideoCommon::NS2BookCapture::Active()) [[unlikely]] {
+        // NS2 Book capture (diagnostics): this dispatch's images.
+        texture_cache.NS2BookCaptureViews(
+            fmt::format("compute native={:016x} pipeline={:016x}", ns2_native_key, shader_hash),
+            std::span<const VideoCommon::ImageViewInOut>(views.data(), views.size()), true);
+    }
 
     // NS2 diagnostics (port of EdenNS2 main's b102/b103 resource log, same format): the resources
     // of the first three runs of every native compute pipeline, and the contents of the small

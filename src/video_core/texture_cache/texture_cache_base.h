@@ -12,7 +12,9 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <span>
+#include <string_view>
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
@@ -233,6 +235,17 @@ public:
     /// and writes it with a small header to `path`. Waits for the host GPU. Returns false when
     /// there is no image.
     bool NS2CaptureImageView(ImageViewId id, const std::filesystem::path& path);
+
+    /// NS2 Book capture (diagnostics, video_core/ns2_book_capture.h): while the capture frame is
+    /// active, logs one draw or dispatch (render targets for draws, each texture descriptor and the
+    /// image it resolved to) and saves every image once before its first use.
+    void NS2BookCaptureViews(std::string_view what, std::span<const ImageViewInOut> views, bool compute);
+
+    /// NS2 Book capture: logs an event (skipped draw, upload, blit) while the capture frame is active.
+    void NS2BookCaptureNote(std::string_view text);
+
+    /// NS2 Book capture: saves the images the capture frame wrote and closes the log.
+    void NS2BookCaptureFinish();
 
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
@@ -658,6 +671,14 @@ private:
     };
     std::unordered_map<u32, PlaneState> plane_states;
     bool frame_trace{};
+    // NS2 Book capture state (diagnostics).
+    bool NS2CaptureImage(Image& image, const std::filesystem::path& path);
+    std::string NS2BookDescribeImage(ImageId image_id);
+    void NS2BookSaveImage(ImageId image_id, std::string_view when);
+    bool ns2_book_open{};
+    u64 ns2_book_bytes{};
+    std::set<u32> ns2_book_saved;
+    std::map<u32, GPUVAddr> ns2_book_written;
     u64 frame_trace_first_movie_frame{~0ULL};
     u32 frame_trace_ops{};
     std::string frame_trace_line;

@@ -102,6 +102,9 @@ public:
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     std::string NS2DescribeGpuRange(DAddr addr, u64 size) override;
+
+    /// NS2 Book capture (diagnostics): saves the images the capture frame wrote, closes the log.
+    void NS2BookCaptureFinish();
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;

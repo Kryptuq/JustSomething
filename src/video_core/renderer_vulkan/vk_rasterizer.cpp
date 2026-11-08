@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/ns2_frame_trace.h"
+#include "video_core/ns2_book_capture.h"
 #include "common/assert.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -268,6 +269,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        if (VideoCommon::NS2BookCapture::Active()) [[unlikely]] {
+            texture_cache.NS2BookCaptureNote(fmt::format("draw SKIPPED ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}",
+                                                         reason, vs, ps, regs.rt[0].Address(),
+                                                         regs.rt[0].width, regs.rt[0].height));
+        }
         if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {
             LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
@@ -2480,6 +2486,11 @@ void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     }
     pipeline_cache.EraseChannel(channel_id);
     query_cache.EraseChannel(channel_id);
+}
+
+void RasterizerVulkan::NS2BookCaptureFinish() {
+    std::scoped_lock lock{texture_cache.mutex};
+    texture_cache.NS2BookCaptureFinish();
 }
 
 } // namespace Vulkan

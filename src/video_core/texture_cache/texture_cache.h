@@ -33,6 +33,8 @@
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/ns2_book_capture.h"
+#include "common/scm_rev.h"
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
@@ -574,8 +576,13 @@ bool TextureCache<P>::NS2CaptureImageView(ImageViewId id, const std::filesystem:
     if (!view.image_id) {
         return false;
     }
-    Image& image = slot_images[view.image_id];
-    if (image.info.type == ImageType::Buffer || image.unswizzled_size_bytes == 0) {
+    return NS2CaptureImage(slot_images[view.image_id], path);
+}
+
+template <class P>
+bool TextureCache<P>::NS2CaptureImage(Image& image, const std::filesystem::path& path) {
+    if (image.info.type == ImageType::Buffer || image.unswizzled_size_bytes == 0 ||
+        True(image.flags & ImageFlagBits::Unbacked)) {
         return false;
     }
     auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
@@ -603,6 +610,153 @@ bool TextureCache<P>::NS2CaptureImageView(ImageViewId id, const std::filesystem:
     file.write(reinterpret_cast<const char*>(map.mapped_span.data() + level0.buffer_offset),
                static_cast<std::streamsize>(bytes));
     return static_cast<bool>(file);
+}
+
+template <class P>
+std::string TextureCache<P>::NS2BookDescribeImage(ImageId image_id) {
+    const Image& image = slot_images[image_id];
+    const ImageInfo& info = image.info;
+    const std::string layout =
+        info.type == ImageType::Linear
+            ? fmt::format("linear pitch={}", info.pitch)
+            : fmt::format("block-linear block={}x{}x{} tile_width_spacing={}", info.block.width,
+                          info.block.height, info.block.depth, info.tile_width_spacing);
+    return fmt::format("img{} gpu={:#x} {}x{}x{} layers={} levels={} type={} fmt={} samples={} {} "
+                       "native_tiling={} guest_bytes={:#x} flags={:#x}{}{}",
+                       image_id.index, image.gpu_addr, info.size.width, info.size.height,
+                       info.size.depth, info.resources.layers, info.resources.levels,
+                       static_cast<u32>(info.type), static_cast<u32>(info.format), info.num_samples,
+                       layout, info.native_tiling, image.guest_size_bytes,
+                       static_cast<u32>(image.flags),
+                       True(image.flags & ImageFlagBits::GpuModified) ? " GPU-written" : "",
+                       True(image.flags & ImageFlagBits::CpuModified) ? " CPU-modified" : "");
+}
+
+template <class P>
+void TextureCache<P>::NS2BookSaveImage(ImageId image_id, std::string_view when) {
+    namespace Capture = NS2BookCapture;
+    Image& image = slot_images[image_id];
+    const u64 bytes = u64{image.unswizzled_size_bytes} + image.guest_size_bytes;
+    if (bytes > Capture::MaxImageBytes || ns2_book_bytes + bytes > Capture::MaxTotalBytes) {
+        Capture::Line(fmt::format("    img{} {} NOT saved (size budget: {:#x} bytes, {:#x} used)",
+                                  image_id.index, when, bytes, ns2_book_bytes));
+        return;
+    }
+    ns2_book_bytes += bytes;
+    const auto base = Capture::Directory() / fmt::format("img{}_{}", image_id.index, when);
+    // The host GPU copy (level 0, all layers).
+    const bool host = NS2CaptureImage(image, base.string() + "_host.ns2img");
+    // The raw bytes at the image's address in game memory (tiled as described in capture.txt).
+    // For a GPU-written image game memory is only current after a download.
+    bool guest = false;
+    bool guest_zero = true;
+    if (image.guest_size_bytes != 0 && gpu_memory->IsFullyMappedRange(image.gpu_addr, image.guest_size_bytes)) {
+        std::vector<u8> data(image.guest_size_bytes);
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, data.data(), data.size());
+        guest_zero = std::all_of(data.begin(), data.end(), [](u8 byte) { return byte == 0; });
+        std::ofstream file(base.string() + ".guest", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        guest = static_cast<bool>(file);
+    }
+    Capture::Line(fmt::format("    saved img{} {}: host={} guest={}{}", image_id.index, when, host, guest,
+                              guest ? (guest_zero ? " (game memory all zero)" : "") : " (unmapped)"));
+}
+
+template <class P>
+void TextureCache<P>::NS2BookCaptureViews(std::string_view what, std::span<const ImageViewInOut> views,
+                                          bool compute) {
+    namespace Capture = NS2BookCapture;
+    if (!Capture::Active() || channel_state == nullptr) {
+        return;
+    }
+    if (!ns2_book_open) {
+        ns2_book_open = true;
+        Capture::Open();
+        Capture::Line(fmt::format("NS2 Book capture, build {} {}\n"
+                                  "One frame after the screenshot. Lines: events in order. 'tex' = descriptor "
+                                  "(raw TIC words from game memory) -> resolved image.",
+                                  Common::g_scm_branch, Common::g_scm_desc));
+    }
+    const u32 event = Capture::NextEvent();
+    Capture::Line(fmt::format("#{} {} {}", event, compute ? "dispatch" : "draw", what));
+    const auto note_image = [&](ImageViewId view_id, std::string_view role, bool written) {
+        if (!view_id) {
+            return;
+        }
+        const ImageViewBase& view = slot_image_views[view_id];
+        if (!view.image_id) {
+            Capture::Line(fmt::format("    {} view{} without image fmt={}", role, view_id.index,
+                                      static_cast<u32>(view.format)));
+            return;
+        }
+        Capture::Line(fmt::format("    {} view{} fmt={} -> {}", role, view_id.index,
+                                  static_cast<u32>(view.format), NS2BookDescribeImage(view.image_id)));
+        if (ns2_book_saved.insert(view.image_id.index).second) {
+            NS2BookSaveImage(view.image_id, fmt::format("before_event{}", event));
+        }
+        if (written) {
+            ns2_book_written.emplace(view.image_id.index, slot_images[view.image_id].gpu_addr);
+        }
+    };
+    if (!compute) {
+        for (size_t i = 0; i < render_targets.color_buffer_ids.size(); ++i) {
+            note_image(render_targets.color_buffer_ids[i], fmt::format("rt{}", i), true);
+        }
+        note_image(render_targets.depth_buffer_id, "depth", true);
+    }
+    auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
+    for (size_t i = 0; i < views.size(); ++i) {
+        const u32 index = Tegra::Texture::TextureHeaderIndex(views[i].index, table.current_limit,
+                                                             gpu_memory->UsesNativeTiling());
+        std::string descriptor = "out of table";
+        if (index <= table.current_limit && table.current_gpu_addr != 0) {
+            std::array<u32, 8> words{};
+            gpu_memory->ReadBlockUnsafe(table.current_gpu_addr + u64{index} * sizeof(words), words.data(),
+                                        sizeof(words));
+            descriptor = fmt::format("tic[{}]@{:#x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                                     index, table.current_gpu_addr + u64{index} * sizeof(words), words[0],
+                                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        }
+        Capture::Line(fmt::format("  tex{} handle={:#x} {}", i, views[i].index, descriptor));
+        if (!views[i].id) {
+            Capture::Line("    -> null view (nothing bound)");
+            continue;
+        }
+        // Compute views may be storage images: treat them as written, saved again at the end.
+        note_image(views[i].id, "->", compute);
+    }
+}
+
+template <class P>
+void TextureCache<P>::NS2BookCaptureNote(std::string_view text) {
+    if (NS2BookCapture::Active()) {
+        NS2BookCapture::Line(fmt::format("#{} {}", NS2BookCapture::NextEvent(), text));
+    }
+}
+
+template <class P>
+void TextureCache<P>::NS2BookCaptureFinish() {
+    namespace Capture = NS2BookCapture;
+    if (!ns2_book_open) {
+        Capture::Open();
+        Capture::Line("NS2 Book capture: no draw or dispatch in the capture frame");
+        Capture::Close();
+        return;
+    }
+    Capture::Line(fmt::format("END OF FRAME: images written by the frame ({}), after the frame:",
+                              ns2_book_written.size()));
+    for (const auto [image_id, image] : slot_images) {
+        const auto it = ns2_book_written.find(image_id.index);
+        if (it == ns2_book_written.end() || it->second != image->gpu_addr) {
+            continue;
+        }
+        Capture::Line(fmt::format("  {}", NS2BookDescribeImage(image_id)));
+        NS2BookSaveImage(image_id, "end");
+    }
+    Capture::Line(fmt::format("saved image data: {:#x} bytes", ns2_book_bytes));
+    Capture::Close();
+    ns2_book_written.clear();
+    ns2_book_saved.clear();
 }
 
 template <class P>
@@ -1141,6 +1295,10 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     const BlitImages images = *result;
     const ImageId dst_id = images.dst_id;
     const ImageId src_id = images.src_id;
+    if (NS2BookCapture::Active()) [[unlikely]] {
+        NS2BookCaptureNote(fmt::format("blit {} -> {}", NS2BookDescribeImage(src_id), NS2BookDescribeImage(dst_id)));
+        ns2_book_written.emplace(dst_id.index, slot_images[dst_id].gpu_addr);
+    }
 
     if (frame_trace) {
         FrameTraceBegin("blit");
@@ -1710,6 +1868,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    if (NS2BookCapture::Active()) [[unlikely]] {
+        NS2BookCaptureNote(fmt::format("upload from game memory: {}", NS2BookDescribeImage(image_id)));
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
