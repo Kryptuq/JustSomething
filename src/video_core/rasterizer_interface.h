@@ -9,6 +9,7 @@
 #include <array>
 #include <functional>
 #include <optional>
+#include <string>
 #include <span>
 #include <utility>
 #include "common/common_types.h"
@@ -110,6 +111,11 @@ public:
 
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
+
+    /// Diagnostics only (NS2, D4): the GPU caches' state of a range, as text (empty if unsupported).
+    virtual std::string NS2DescribeGpuRange([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {
+        return {};
+    }
 
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,

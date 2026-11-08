@@ -1057,6 +1057,17 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
 }
 
+std::string RasterizerVulkan::NS2DescribeGpuRange(DAddr addr, u64 size) {
+    bool texture_modified = false;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_modified = texture_cache.IsRegionGpuModified(addr, size);
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    return fmt::format("texture cache GPU-modified {}; buffer cache: {}", texture_modified,
+                       buffer_cache.NS2DescribeRange(addr, size));
+}
+
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};

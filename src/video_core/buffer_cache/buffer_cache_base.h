@@ -18,6 +18,7 @@
 #include <source_location>
 #include <span>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 #include "common/container/unordered_map.h"
@@ -354,6 +355,11 @@ public:
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
+
+    /// Diagnostics only (yoshi-int-build-34, D4): the cache's state of [addr, addr + size) and
+    /// what the host buffers and guest memory hold there. Reads the host buffers through a staging
+    /// copy without changing any tracking state; waits for the GPU.
+    [[nodiscard]] std::string NS2DescribeRange(DAddr addr, u64 size);
 
     /// Return true when a CPU region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(DAddr addr, size_t size);

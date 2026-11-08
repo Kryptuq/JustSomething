@@ -31,6 +31,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/ns2_buffer_events.h"
 #include "video_core/nx2.h"
 #include "video_core/ns2_program_address_trace.h"
 #include "video_core/shader_cache.h"
@@ -199,6 +200,30 @@ void ReportProgramAddressOrigin(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Mem
     }
     LOG_INFO(HW_GPU, "NS2 address origin #{}: latest MME DMA reads:{}", number,
              dma.empty() ? std::string{" none"} : dma);
+    // D4 (yoshi-int-build-34): the GPU caches' view of the program's first 4 KiB before and after
+    // a flush like the one the shader loader's ReadBlock does, and the buffer cache events that
+    // touched it.
+    if (const auto device = gpu_memory.GpuToCpuAddress(program)) {
+        namespace Events = VideoCommon::NS2BufferEvents;
+        constexpr u64 Window = 0x1000;
+        auto& rasterizer = maxwell3d.Rasterizer();
+        LOG_INFO(HW_GPU, "NS2 address origin #{}: D4 before flush, device {:#x}+{:#x}: {}", number, *device,
+                 Window, rasterizer.NS2DescribeGpuRange(*device, Window));
+        Events::ThreadDownloadedBytes() = 0;
+        gpu_memory.FlushRegion(program, Window);
+        LOG_INFO(HW_GPU, "NS2 address origin #{}: D4 the flush downloaded {:#x} bytes; after: {}", number,
+                 Events::ThreadDownloadedBytes(), rasterizer.NS2DescribeGpuRange(*device, Window));
+        std::string events;
+        const u64 now_us = Events::NowMicros();
+        for (const auto& event : Events::Overlapping(*device, Range, 24)) {
+            events += fmt::format(" [{:.1f}ms ago {} {:#x}+{:#x} (buffer_cache.h:{})]",
+                                  static_cast<double>(now_us - event.time_us) / 1000.0, Events::Name(event.kind),
+                                  event.address, event.size, event.line);
+        }
+        LOG_INFO(HW_GPU, "NS2 address origin #{}: D4 buffer cache events on {:#x}+{:#x} (ring covers {:.1f} ms), newest first:{}",
+                 number, *device, Range, static_cast<double>(Events::RingSpanMicros()) / 1000.0,
+                 events.empty() ? std::string{" none"} : events);
+    }
     // Data RAM at the low word's store, and (once) the macro code, for offline replay.
     std::error_code ec;
     const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_macro_yoshi-integration";

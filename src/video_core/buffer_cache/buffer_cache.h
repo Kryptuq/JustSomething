@@ -17,6 +17,7 @@
 
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/ns2_buffer_events.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -182,6 +183,7 @@ template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
     Nx2NoteListHostWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
+        VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::CpuWriteCleared, device_addr, size, __LINE__);
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
     }
@@ -281,6 +283,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     }
 
     ClearDownload(*cpu_dest_address, amount);
+    VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::CopyDestinationCleared, *cpu_dest_address, amount, __LINE__);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
 
     BufferId buffer_a;
@@ -308,8 +311,10 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         tmp_intervals.push_back({new_base_address, size});
         if (DownloadsAtFence(new_base_address, size)) {
             uncommitted_gpu_modified_ranges.Add(new_base_address, size);
+            VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::CopyMarkedFence, new_base_address, size, __LINE__);
         } else {
             ArmReadTraps(new_base_address, size);
+            VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::CopyMarkedTrap, new_base_address, size, __LINE__);
         }
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
@@ -353,6 +358,7 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     }
 
     const size_t size = amount * sizeof(u32);
+    VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::ClearDestinationCleared, *cpu_dst_address, size, __LINE__);
     ClearDownload(*cpu_dst_address, size);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
 
@@ -395,6 +401,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
         MarkWrittenBuffer(buffer_id, device_addr, size);
         break;
     case ObtainBufferOperation::DiscardWrite: {
+        VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::OtherCleared, device_addr, size, __LINE__);
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
         break;
@@ -806,6 +813,7 @@ void BufferCache<P>::PopAsyncBuffers() {
                                            end - start);
         });
         async_downloads.Subtract(device_addr, copy.size, [&](DAddr start, DAddr end) {
+            VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::FenceDownloaded, start, end - start, __LINE__);
             gpu_modified_ranges.Subtract(start, end - start);
         });
     }
@@ -819,6 +827,58 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
+}
+
+template <class P>
+std::string BufferCache<P>::NS2DescribeRange(DAddr addr, u64 size) {
+    u64 gpu_modified_bytes = 0, trapped_bytes = 0, fence_pending_bytes = 0;
+    gpu_modified_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { gpu_modified_bytes += end - start; });
+    read_trapped_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { trapped_bytes += end - start; });
+    uncommitted_gpu_modified_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { fence_pending_bytes += end - start; });
+    std::vector<u8> host(size, 0);
+    std::string buffers;
+    if constexpr (USE_MEMORY_MAPS) {
+        ForEachBufferInRange(addr, size, [&](BufferId buffer_id, Buffer& buffer) {
+            const DAddr start = (std::max)(addr, buffer.CpuAddr());
+            const DAddr end = (std::min)(addr + size, buffer.CpuAddr() + buffer.SizeBytes());
+            if (start >= end) {
+                return;
+            }
+            buffers += fmt::format(" buffer {} [{:#x}+{:#x})", buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes());
+            auto staging = runtime.DownloadStagingBuffer(end - start);
+            std::array<BufferCopy, 1> copies{BufferCopy{
+                .src_offset = start - buffer.CpuAddr(),
+                .dst_offset = staging.offset,
+                .size = end - start,
+            }};
+            const std::span<BufferCopy> copies_span(copies.data(), copies.size());
+            runtime.CopyBuffer(staging.buffer, buffer, copies_span, true);
+            runtime.Finish();
+            std::memcpy(host.data() + (start - addr), staging.mapped_span.data(), end - start);
+        });
+    }
+    std::vector<u8> guest(size, 0);
+    device_memory.ReadBlockUnsafe(addr, guest.data(), size);
+    const auto nonzero = [](const std::vector<u8>& bytes) {
+        return static_cast<u64>(std::count_if(bytes.begin(), bytes.end(), [](u8 b) { return b != 0; }));
+    };
+    u64 equal = 0;
+    for (u64 i = 0; i < size; ++i) equal += host[i] == guest[i];
+    const auto words = [](const std::vector<u8>& bytes) {
+        std::array<u32, 4> w{};
+        std::memcpy(w.data(), bytes.data(), (std::min<size_t>)(bytes.size(), sizeof(w)));
+        return fmt::format("{:08x}", fmt::join(w, " "));
+    };
+    return fmt::format(
+        "registered {}, GPU-modified {:#x} bytes (tracker {}), CPU-modified {}, read-trapped {:#x}, "
+        "fence download pending {:#x}, preflushable {}, fence downloads for this range {}; host "
+        "buffer nonzero {:#x}/{:#x} ({}), guest memory nonzero {:#x}/{:#x} ({}), host==guest {:#x} "
+        "bytes;{}",
+        IsRegionRegistered(addr, size), gpu_modified_bytes, memory_tracker.IsRegionGpuModified(addr, size),
+        memory_tracker.IsRegionCpuModified(addr, size), trapped_bytes, fence_pending_bytes,
+        memory_tracker.IsRegionPreflushable(addr, size), DownloadsAtFence(addr, size), nonzero(host), size,
+        words(host), nonzero(guest), size, words(guest), equal,
+        buffers.empty() ? std::string{" no buffer"} : buffers);
 }
 
 template <class P>
@@ -1762,8 +1822,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     gpu_modified_ranges.Add(device_addr, size);
     if (DownloadsAtFence(device_addr, size)) {
         uncommitted_gpu_modified_ranges.Add(device_addr, size);
+        VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::MarkedGpuModifiedFence, device_addr, size, __LINE__);
     } else {
         ArmReadTraps(device_addr, size);
+        VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::MarkedGpuModifiedTrap, device_addr, size, __LINE__);
     }
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
@@ -2180,6 +2242,7 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         const auto add_upload = [&](DAddr start, DAddr end) {
             if (start == end) return;
             const u64 range_size = end - start;
+            VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::UploadedToHost, start, range_size, __LINE__);
             upload_copies.push_back(BufferCopy{
                 .src_offset = total_size_bytes,
                 .dst_offset = start - buffer_start,
@@ -2312,6 +2375,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::OtherCleared, dest_address, copy_size, __LINE__);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);
@@ -2362,6 +2426,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
                                                         .size = end - start,
                                                     }});
                     total_size_bytes += Common::AlignUp(end - start, 64);
+                    VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::FlushDownloaded, start, end - start, __LINE__);
                 });
                 ClearDownload(device_addr_out, range_size);
                 gpu_modified_ranges.Subtract(device_addr_out, range_size);
@@ -2411,7 +2476,11 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
                 largest_copy = (std::max)(largest_copy, new_size);
             };
 
-            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, [&](DAddr start, DAddr end) {
+                add_download(start, end);
+                VideoCommon::NS2BufferEvents::Note(VideoCommon::NS2BufferEvents::Kind::FlushDownloaded, start, end - start, __LINE__);
+                VideoCommon::NS2BufferEvents::ThreadDownloadedBytes() += end - start;
+            });
             ClearDownload(device_addr_out, range_size);
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
