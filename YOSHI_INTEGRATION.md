@@ -450,3 +450,13 @@ Two separate commits, diagnostics only:
   chunks with a manifest per kernel in `log/ns2_network_yoshi-integration/`. The reconstruction
   capture now saves its program from the program address.
 All these files are game data: keep them local, never commit them.
+
+## yoshi-int-build-35: fence downloads for Switch 2 titles (flicker fix)
+yoshi-int-build-34 results: the rejected gameplay vertex programs are valid code written by the
+guest CPU; the shader loader's flush copied stale host buffer bytes over them (zero holes, 0xff
+tails) because GPU-written ranges stayed marked without fence downloads. The DLSS network's first
+layer (557f) wrote nothing to its outputs on the GPU in that run, although its inputs were valid
+and the same translation writes them offline; binding sizes are not involved.
+- Fix: AsyncBufferDownloads() is true for Switch 2 titles again (as in EdenNS2 main); read traps
+  remain in the code but no longer arm. EDEN_NX2_BUFFER_DOWNLOADS=0 restores the old behaviour.
+- The D4/D5 diagnostics stay in this build to compare with yoshi-int-build-34.
