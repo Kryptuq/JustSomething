@@ -383,26 +383,6 @@ private:
 
     void RefreshContents(Image& image, ImageId image_id);
 
-    /// Yoshi movie diagnostics (from EdenNS2 builds 62-73): large one/two-channel images (the
-    /// movie's Y/UV planes the game copies each decoded frame into from the CPU).
-    static bool IsPlaneImage(const ImageBase& image) noexcept;
-    u64 PlaneHash(const ImageBase& image, u64* mean) const;
-    void NotePlaneUpload(Image& image, ImageId image_id);
-    void TracePlaneUse(Image& image, ImageId image_id);
-    /// Yoshi movie diagnostics: whole-frame trace (every draw, dispatch, blit and DMA copy with
-    /// the images it reads and writes) for a few frames while the title movie plays.
-    void FrameTraceBegin(const char* kind);
-    void FrameTraceNote(const ImageBase& image, bool write);
-    void FrameTraceFlush();
-
-public:
-    /// Yoshi movie diagnostics: why a texture handle resolves to no image.
-    std::string DescribeImageIndex(u32 index, bool compute);
-    /// Yoshi movie diagnostics: indices of the 1920x1080 / 960x540 headers in the table.
-    std::vector<u32> MovieSizedHeaders(bool compute);
-
-private:
-
     /// Upload data from guest to an image
     template <typename StagingBuffer>
     void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
@@ -638,27 +618,6 @@ private:
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
     std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;
-    struct PlaneState {
-        GPUVAddr gpu_addr{};
-        u64 hash{};             ///< Sparse checksum of the guest memory at the last upload/check
-        u64 checked_frame{~0ULL};
-        u64 upload_frame{~0ULL};
-        u32 uploads{};
-        u32 cpu_writes{};       ///< Write notifications the cache got for it
-        u32 untracked{};        ///< Memory changed without a write notification
-    };
-    std::unordered_map<u32, PlaneState> plane_states;
-    bool frame_trace{};
-    u64 frame_trace_first_movie_frame{~0ULL};
-    u32 frame_trace_ops{};
-    std::string frame_trace_line;
-    std::vector<std::pair<GPUVAddr, bool>> frame_trace_items;
-    std::vector<u32> plane_binds;
-    std::string plane_bind_log;
-    u64 plane_uploads_total{};
-    u64 plane_cpu_writes_total{};
-    u64 plane_untracked_total{};
-    u64 plane_images_total{};
     /// Guest memory images were uploaded from since the last cold hint (device address, size).
     std::vector<std::pair<DAddr, u64>> uploaded_ranges;
 

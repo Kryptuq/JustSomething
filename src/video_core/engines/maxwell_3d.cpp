@@ -10,7 +10,6 @@
 #include <limits>
 #include <optional>
 #include "common/assert.h"
-#include "common/ns2_frame_trace.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -611,29 +610,6 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
 }
 
 void Maxwell3D::ProcessQueryGet() {
-    // Yoshi diagnostics (yint-24): an NVN fence release reaching execution, with how many draws
-    // this thread configured before it (its position among the draws).
-    if (Common::NS2FrameTrace::SemaphoreTraceOn()) [[unlikely]] {
-        const u32 d = regs.report_semaphore.query.raw;
-        int slot = Common::NS2FrameTrace::FindSemaphoreSlotGpu(regs.report_semaphore.Address());
-        // Release of one word with the fence bit (NVN fence syncs), also when it was not parsed
-        // as a plain method write (macros).
-        if (slot < 0 && (d & 3) == 0 && ((d >> 4) & 1) != 0 && ((d >> 28) & 1) != 0) {
-            slot = Common::NS2FrameTrace::RegisterSemaphoreSlot(
-                regs.report_semaphore.Address(),
-                reinterpret_cast<uintptr_t>(memory_manager.GetPointer(regs.report_semaphore.Address())));
-        }
-        if (slot >= 0 && Common::NS2FrameTrace::TakeSemaphoreTrace()) {
-            LOG_INFO(HW_GPU,
-                     "NS2 sem trace: seq {} t={}us present {} EXEC slot {} payload {:#x} (D {:#x}) "
-                     "after {} configured draws; slot value now {:#x}",
-                     Common::NS2FrameTrace::NextSequence(), Common::NS2FrameTrace::TraceMicros(),
-                     Common::NS2FrameTrace::PresentsReturned().load(std::memory_order_relaxed), slot,
-                     regs.report_semaphore.payload, regs.report_semaphore.query.raw,
-                     Common::NS2FrameTrace::DrawsConfigured().load(std::memory_order_relaxed),
-                     Common::NS2FrameTrace::SemaphoreSlotValue(slot));
-        }
-    }
     VideoCommon::QueryPropertiesFlags flags{};
     if (regs.report_semaphore.query.short_query == 0) {
         flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
@@ -759,12 +735,6 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
         LOG_INFO(HW_GPU, "Constant buffer bind: stage {} slot {} address {:#x} size {:#x}", stage_index,
                  bind_data.shader_slot.Value(), regs.const_buffer.Address(), regs.const_buffer.size);
     }
-    if (stage_index == 4 && Common::NS2FrameTrace::Active().load(std::memory_order_relaxed)) {
-        // Yoshi movie diagnostics: every fragment constant buffer bind of a traced frame.
-        LOG_INFO(HW_GPU, "NS2 frame trace: fragment cbuf bind slot {} valid {} address {:#x} size {:#x}",
-                 bind_data.shader_slot.Value(), bind_data.valid.Value(), regs.const_buffer.Address(),
-                 regs.const_buffer.size);
-    }
     if (bind_data.shader_slot >= Regs::MaxConstBuffers) {
         return; // slot field is 5 bits; the state array holds 18
     }
@@ -793,21 +763,6 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
 
     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
     const size_t copy_size = amount * sizeof(u32);
-    if (const u64 watched = Common::NS2FrameTrace::WatchedConstBuffer().load(std::memory_order_relaxed);
-        watched != 0 && buffer_address <= watched && watched < buffer_address + regs.const_buffer.size) {
-        // Yoshi movie diagnostics: what the game uploads into the constant buffer that holds the
-        // movie draw's texture handles.
-        static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 300) {
-            std::string words;
-            for (u32 i = 0; i < std::min<u32>(amount, 8); ++i) {
-                words += fmt::format(" {:08x}", start_base[i]);
-            }
-            LOG_INFO(HW_GPU, "NS2 frame trace: inline upload to watched cbuf {:#x} (buffer {:#x}+{:#x}, {} words, GPU frame {}):{}",
-                     watched, buffer_address, regs.const_buffer.offset, amount,
-                     Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed), words);
-        }
-    }
     memory_manager.WriteBlockCached(address, start_base, copy_size);
 
     // Increment the current buffer position.

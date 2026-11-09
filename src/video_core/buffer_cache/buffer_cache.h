@@ -7,7 +7,6 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -794,7 +793,6 @@ void BufferCache<P>::PopAsyncBuffers() {
     }
     auto& downloads = pending_downloads.front();
     auto& async_buffer = async_buffers.front();
-    const Common::NS2FrameTrace::EmulatorWriteTagScope tag{"async buffer download (fence)"};
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
     for (const auto& copy : downloads) {
@@ -1295,11 +1293,6 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
             // null descriptor: the console reads zeros). Bind a null view with a valid format
             // instead of asking Vulkan for the format of an invalid surface (which aborted).
             format = PixelFormat::R32_UINT;
-            static std::atomic<u32> null_logs{0};
-            if (null_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(HW_GPU, "NS2: texture buffer {} is unmapped or empty (GPU address {:#x}): "
-                            "bound as a null buffer view", index, binding.gpu_addr);
-            }
         }
         buffer.MarkUsage(offset, size);
         if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
@@ -1454,11 +1447,6 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
             // null descriptor: the console reads zeros). Bind a null view with a valid format
             // instead of asking Vulkan for the format of an invalid surface (which aborted).
             format = PixelFormat::R32_UINT;
-            static std::atomic<u32> null_logs{0};
-            if (null_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(HW_GPU, "NS2: texture buffer {} is unmapped or empty (GPU address {:#x}): "
-                            "bound as a null buffer view", index, binding.gpu_addr);
-            }
         }
         buffer.MarkUsage(offset, size);
         if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
@@ -1732,25 +1720,7 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 }
 
 template <class P>
-void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync,
-                                       std::source_location where) {
-    // Yoshi diagnostics (writer trace): what makes a watched constant page GPU-written.
-    if (Common::NS2FrameTrace::WriterPageCount().load(std::memory_order_relaxed) != 0) [[unlikely]] {
-        if (const u8* host = device_memory.GetPointer<u8>(device_addr); host != nullptr) {
-            const int page = Common::NS2FrameTrace::FindWriterPageHost(reinterpret_cast<uintptr_t>(host), size);
-            if (page >= 0 && Common::NS2FrameTrace::GpuWrittenMarkBudget().fetch_sub(1, std::memory_order_relaxed) > 0) {
-                LOG_INFO(HW_GPU,
-                         "NS2 writer trace: t={}us GPU frame {} present {} buffer cache marks device "
-                         "[{:#x}, {:#x}) GPU-written (watched page {}; buffer {}; buffer_cache.h:{}; "
-                         "downloads at fence {})",
-                         Common::NS2FrameTrace::TraceMicros(),
-                         Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed),
-                         Common::NS2FrameTrace::PresentsReturned().load(std::memory_order_relaxed),
-                         device_addr, device_addr + size, page, buffer_id.index, where.line(),
-                         DownloadsAtFence(device_addr, size));
-            }
-        }
-    }
+void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -2378,7 +2348,6 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
     runtime.Finish();
-    const Common::NS2FrameTrace::EmulatorWriteTagScope tag{"buffer download (DownloadBuffersMemory)"};
     const u8* const mapped_memory = download_staging.mapped_span.data();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
@@ -2418,7 +2387,6 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if (total_size_bytes == 0) {
         return;
     }
-    const Common::NS2FrameTrace::EmulatorWriteTagScope tag{"buffer flush download (DownloadBufferMemory)"};
 
     if constexpr (USE_MEMORY_MAPS) {
         auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
@@ -2576,7 +2544,6 @@ TextureBufferBinding BufferCache<P>::GetTextureBufferBinding(GPUVAddr gpu_addr, 
                                                              PixelFormat format) {
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
     TextureBufferBinding binding;
-    binding.gpu_addr = gpu_addr;
     if (!device_addr || size == 0) {
         binding.device_addr = 0;
         binding.size = 0;

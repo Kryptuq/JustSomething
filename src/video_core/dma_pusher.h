@@ -126,23 +126,7 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
-    /// NativeSubmissions::Record sequence of each entry's snapshot (EdenNS2's reuse rule).
-    std::vector<u64> submitted_sequences;
-    /// Steady-clock time of the snapshot in microseconds (NS2 diagnostics).
-    u64 submit_time_us = 0;
 };
-
-/// Snapshots of command lists by address, to tell a list the game reused for a later submission
-/// (run the snapshot) from one it completed in place after submitting it (run the memory). From
-/// EdenNS2 (builds 91-96), where Yoshi's movie and channel-1 lists need both.
-namespace NativeSubmissions {
-u64 Record(s32 channel, GPUVAddr address, std::span<const CommandHeader> words);
-/// Whether a later submission of the list at `address` captured contents with this hash.
-bool ClaimedLater(s32 channel, GPUVAddr address, u64 sequence, u64 hash);
-/// Whether changes of this list were mostly claimed by later submissions so far.
-bool UsuallyReused(s32 channel, GPUVAddr address);
-void NoteOutcome(s32 channel, GPUVAddr address, bool reused);
-} // namespace NativeSubmissions
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
 inline u64 HashPushbufferWords(std::span<const u32> words) {
@@ -159,7 +143,6 @@ inline u64 HashPushbufferWords(std::span<const u32> words) {
 /// See https://envytools.readthedocs.io/en/latest/hw/fifo/dma-pusher.html#fifo-dma-pusher for
 /// details on this implementation.
 class DmaPusher final {
-    std::vector<u32> ns2_live_words; ///< Scratch for the snapshot reuse rule
 public:
     /// Counts suspensions on a semaphore acquire and the resumes after them, so it is odd while
     /// the channel is suspended (see CommandList::snapshot_suspensions).
@@ -205,9 +188,6 @@ private:
     [[nodiscard]] bool WantsSegment() const;
     void ReportUnboundSubchannel();
     void WatchArgument(u32 method, u32 argument) const;
-    /// Yoshi diagnostics (yint-24): a 3D report-semaphore register write (methods 0x6c0-0x6c3).
-    void NoteReportSemaphore(u32 argument);
-    void NoteEntrySource(const char* source, const CommandList& command_list);
 
 public:
     /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
@@ -261,21 +241,6 @@ public:
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
     void ResolveSplitMethod(GPUVAddr entry_address);
-
-    // Yoshi diagnostics (yint-24): where the words of the entry being parsed come from, its
-    // submit-time copy (if it has one) and the report-semaphore registers seen so far.
-    const char* ns2_entry_source = "unknown";
-    const CommandHeader* ns2_entry_copy = nullptr;
-    u32 ns2_entry_size = 0;
-    u32 ns2_entry_index = 0;
-    u64 ns2_entry_submit_us = 0;
-    u32 ns2_sem_high = 0;
-    u32 ns2_sem_low = 0;
-    u32 ns2_sem_payload = 0;
-    GPUVAddr ns2_sem_payload_address = 0;
-    const char* ns2_sem_payload_source = "unknown";
-    bool ns2_sem_payload_in_copy = false;
-    u32 ns2_sem_payload_copy = 0;
     static constexpr size_t MaxParkedMethods = 16;
 
     // Debug aid: hashes of the words of the last entries as they were parsed.

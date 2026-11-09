@@ -17,7 +17,6 @@
 #include <initializer_list>
 #include <limits>
 #include <atomic>
-#include "common/ns2_frame_trace.h"
 #include <deque>
 #include <map>
 #include <optional>
@@ -1708,11 +1707,9 @@ private:
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
-        if (m_presents <= 4 || (m_presents % 600) == 0 ||
-            Common::NS2FrameTrace::Active().load(std::memory_order_relaxed)) {
-            LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={} (GPU frame {})",
-                     m_presents, u64{w[2]} | (u64{w[3]} << 32), w[4], w[5],
-                     Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed));
+        if (m_presents <= 4 || (m_presents % 600) == 0) {
+            LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
+                     u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
         }
         // Wait for this frame's fence, so the game doesn't write the next frame's data (constant
         // buffers holding texture handles, vertex data, Pokopia's glyph atlas) while the GPU
@@ -1726,11 +1723,7 @@ private:
             return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
         }();
         const auto entered = std::chrono::steady_clock::now();
-        // Yoshi diagnostics (writer trace): which frame this present waited for.
-        const char* waited_for = "this frame";
         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
-            waited_for = frames_ahead == 1 ? "the previous frame (EDEN_NX2_FRAMES_AHEAD=1)"
-                                           : "the previous frame (a channel waits on a semaphore)";
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
@@ -1747,7 +1740,6 @@ private:
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
             if (gpu_behind) {
                 WaitForFrame(~w[22], w[24]);
-                waited_for = "the previous frame, then this one (GPU behind)";
             }
         } else if (frames_ahead == 0) {
             WaitForFrame(~w[22], w[24]);
@@ -1788,23 +1780,6 @@ private:
                          m_stats.pace_us / 600);
                 m_stats = {.last_present = entered};
             }
-        }
-        // Yoshi diagnostics (writer trace): does the game get its buffers back with this frame's
-        // GPU work unfinished? Writes logged with present N after this belong to frame N + 1.
-        const u64 returned = Common::NS2FrameTrace::PresentsReturned().fetch_add(1, std::memory_order_relaxed) + 1;
-        if (Common::NS2FrameTrace::WriterPageCount().load(std::memory_order_relaxed) != 0 &&
-            Common::NS2FrameTrace::PresentTraceBudget().fetch_sub(1, std::memory_order_relaxed) > 0) {
-            const u32 fence_id = ~w[22];
-            auto& syncpoints = system.Host1x().GetSyncpointManager();
-            const bool known = fence_id < 192;
-            LOG_INFO(Service,
-                     "NS2 present trace: t={}us present {} returned: fence ({}, {:#x}) {} at reply "
-                     "(guest {:#x}); waited for {} ({} us), channels suspended {}",
-                     Common::NS2FrameTrace::TraceMicros(), returned, fence_id, w[24],
-                     !known ? "unknown" : syncpoints.IsReadyGuest(fence_id, w[24]) ? "reached" : "NOT reached",
-                     known ? syncpoints.GetGuestSyncpointValue(fence_id) : 0U, waited_for,
-                     std::chrono::duration_cast<std::chrono::microseconds>(waited - entered).count(),
-                     system.GPU().HasSuspendedChannels());
         }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
@@ -2328,13 +2303,6 @@ private:
 
 // True the first time a Switch 2 video command is seen, so each one is logged once in full and new
 // or unexpected commands stand out.
-// Yoshi movie diagnostics: how often the client asks for a decoder image's CPU descriptor (961),
-// which nn::codec's ReadDecoderOutputImageNv12 does for each frame it copies out.
-inline std::atomic<u64>& Nx2CpuImageDescriptorReads() {
-    static std::atomic<u64> reads{};
-    return reads;
-}
-
 inline bool Nx2FirstVideoCommand(std::string_view service, u32 command) {
     static std::mutex mutex;
     static std::set<std::pair<std::string, u32>> seen;
@@ -2602,11 +2570,6 @@ private:
     void ReleaseBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
-        m_outputs_released.fetch_add(1, std::memory_order_relaxed);
-        if (Common::NS2FrameTrace::Active().load(std::memory_order_relaxed)) {
-            LOG_INFO(Service, "NS2 frame trace: decoder image {} given back (GPU frame {})", w[2],
-                     Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed));
-        }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
@@ -2699,12 +2662,6 @@ private:
                 m_outputs.pop_front();
             }
         }
-        (output ? m_outputs_taken : m_outputs_empty).fetch_add(1, std::memory_order_relaxed);
-        if (Common::NS2FrameTrace::Active().load(std::memory_order_relaxed)) {
-            LOG_INFO(Service, "NS2 frame trace: decoder output {} taken (GPU frame {})",
-                     output ? static_cast<s64>(output->image) : -1,
-                     Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed));
-        }
         if (!output) {
             // Nothing finished: the code the client's own Acquire uses for an empty ring.
             IPC::ResponseBuilder rb{ctx, 2};
@@ -2772,16 +2729,6 @@ private:
                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
                              frame.end ? ", end of stream" : "", image);
-                }
-                if ((m_frames_out % 150) == 0) {
-                    // Yoshi movie diagnostics: does the client take every frame, and read it out?
-                    LOG_INFO(Service,
-                             "NS2 movie: {} frames out; client took {} (asked {} times with none "
-                             "ready), gave back {}; CPU image descriptor (961) reads {}",
-                             m_frames_out, m_outputs_taken.load(std::memory_order_relaxed),
-                             m_outputs_empty.load(std::memory_order_relaxed),
-                             m_outputs_released.load(std::memory_order_relaxed),
-                             Nx2CpuImageDescriptorReads().load(std::memory_order_relaxed));
                 }
                 continue;
             }
@@ -2886,7 +2833,6 @@ private:
         decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
                         layout.chroma_offset, bytes);
         DumpFrame(bytes, layout, width, height);
-        LogFrameMeans(bytes, layout, width, height, image_id, address);
         memory.WriteBlock(address, bytes.data(), layout.pitch * height);
         if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
             memory.WriteBlock(address + layout.chroma_offset, bytes.data() + layout.chroma_offset,
@@ -2897,37 +2843,6 @@ private:
             system.GPU().InvalidateRegion(*device, layout.size);
         }
         return {width, height};
-    }
-
-    // Yoshi movie diagnostics: mean Y and U/V of the first frames and then every 300th, to tell
-    // a real picture from a blank one on its way into the image the client reads.
-    void LogFrameMeans(const std::vector<u8>& bytes, const Nx2DecoderImageLayout& layout, u32 width,
-                       u32 height, u32 image_id, u64 address) {
-        if (m_frames_out >= 6 && (m_frames_out % 300) != 0) {
-            return;
-        }
-        u64 y_sum{}, y_count{}, u_sum{}, v_sum{}, uv_count{};
-        if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
-            for (u32 y = 0; y < height; y += 17) {
-                for (u32 x = 0; x < width; x += 13, ++y_count) {
-                    y_sum += bytes[static_cast<size_t>(y) * layout.pitch + x];
-                }
-            }
-            for (u32 y = 0; y < height / 2; y += 17) {
-                for (u32 x = 0; x + 1 < width; x += 26, ++uv_count) {
-                    const size_t at = layout.chroma_offset + static_cast<size_t>(y) * layout.pitch + x;
-                    if (at + 1 >= bytes.size()) break;
-                    u_sum += bytes[at];
-                    v_sum += bytes[at + 1];
-                }
-            }
-        }
-        LOG_INFO(Service,
-                 "NS2 movie: frame {} written to image {} at {:#x} ({}x{} pitch {:#x} chroma at "
-                 "{:#x}): mean Y {} U {} V {}",
-                 m_frames_out, image_id, address, width, height, layout.pitch, layout.chroma_offset,
-                 y_count ? y_sum / y_count : 0, uv_count ? u_sum / uv_count : 0,
-                 uv_count ? v_sum / uv_count : 0);
     }
 
     // EDEN_NX2_VDEC_DUMP=<dir>: save the luma of every 120th decoded frame, a quarter of its size,
@@ -2977,10 +2892,6 @@ private:
     u32 m_height{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
-    // Yoshi movie diagnostics: outputs the client took (213 with / without a frame) and gave back.
-    std::atomic<u64> m_outputs_taken{};
-    std::atomic<u64> m_outputs_empty{};
-    std::atomic<u64> m_outputs_released{};
     std::deque<Input> m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
@@ -3703,11 +3614,6 @@ private:
                     words[8] = static_cast<u32>(layout.pitch);
                 }
             }
-        }
-        Nx2CpuImageDescriptorReads().fetch_add(1, std::memory_order_relaxed);
-        if (Common::NS2FrameTrace::Active().load(std::memory_order_relaxed)) {
-            LOG_INFO(Service, "NS2 frame trace: decoder image {} read out (961, GPU frame {})", id,
-                     Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed));
         }
         if (Nx2FirstVideoCommand("nx2:gsv", 961) || words[0] == 0) {
             LOG_INFO(Service, "nx2:gsv 961 image {} -> kind {:#x} offset {:#x} pitch {:#x}", id,

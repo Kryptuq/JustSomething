@@ -7,13 +7,11 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
-#include <mutex>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
@@ -33,7 +31,6 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 #include "video_core/nx2_profile.h"
-#include "common/ns2_frame_trace.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -376,13 +373,6 @@ template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
-    // Yoshi movie diagnostics: where each texture handle of a traced frame's draw comes from.
-    const bool trace_handles = Common::NS2FrameTrace::Active().load(std::memory_order_relaxed);
-    if (Common::NS2FrameTrace::SemaphoreTraceOn()) [[unlikely]] {
-        Common::NS2FrameTrace::DrawsConfigured().fetch_add(1, std::memory_order_relaxed);
-    }
-    std::vector<std::pair<size_t, std::string>> handle_trace;
-    std::vector<GPUVAddr> handle_cbufs;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
@@ -441,36 +431,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
             return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
         }};
-        const auto note_handle{[&](const auto& desc, u32 index, const char* kind,
-                                   std::pair<u32, u32> handle) {
-            if (!trace_handles) {
-                return;
-            }
-            handle_trace.emplace_back(
-                views.size(),
-                desc.handle_program != ~0U
-                    ? fmt::format("stage {} {} [{}] from handle program {} -> TIC {}", stage, kind,
-                                  index, desc.handle_program, handle.first)
-                    : fmt::format("stage {} {} [{}] from cbuf {}+{:#x} (cbuf at {:#x}, word {:#010x}) -> TIC {}",
-                                  stage, kind, index, desc.cbuf_index, desc.cbuf_offset,
-                                  desc.cbuf_index < cbufs.size() ? cbufs[desc.cbuf_index].address
-                                                                 : GPUVAddr{},
-                                  desc.cbuf_index < cbufs.size() && cbufs[desc.cbuf_index].enabled
-                                      ? gpu_memory->Read<u32>(cbufs[desc.cbuf_index].address +
-                                                              desc.cbuf_offset +
-                                                              (index << desc.size_shift))
-                                      : 0U,
-                                  handle.first));
-            if (desc.handle_program == ~0U && desc.cbuf_index < cbufs.size()) {
-                handle_cbufs.push_back(cbufs[desc.cbuf_index].address + desc.cbuf_offset);
-            } else {
-                handle_cbufs.push_back(0);
-            }
-        }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
-                note_handle(desc, index, "image/buffer", handle);
                 views.push_back({
                     .index = handle.first,
                     .blacklist = blacklist,
@@ -491,7 +454,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
-                note_handle(desc, index, "texture", handle);
                 views.push_back({handle.first});
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
@@ -530,158 +492,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
-    }
-    if (trace_handles) {
-        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        LOG_INFO(Render_Vulkan, "NS2 frame trace:   draw shaders vs={:#x} ps={:#x}, {} views, rt0={:#x} {}x{}",
-                 vs, ps, views.size(), regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
-        for (size_t i = 0; i < handle_trace.size(); ++i) {
-            const auto& [position, text] = handle_trace[i];
-            const auto& view = views[position];
-            if (view.id == VideoCommon::NULL_IMAGE_VIEW_ID && handle_cbufs[i] != 0) {
-                Common::NS2FrameTrace::WatchedConstBuffer().store(handle_cbufs[i], std::memory_order_relaxed);
-                const GPUVAddr block = handle_cbufs[i] & ~GPUVAddr{0xff};
-                Common::NS2FrameTrace::WatchBlock(block, gpu_memory->GpuToCpuAddress(block).value_or(0),
-                                                  Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed));
-                // Writer trace: the first page of the block's region (the handle block of the
-                // movie draw is the region's first allocation, at +0x100).
-                const GPUVAddr page = block & ~GPUVAddr{0xfff};
-                if (const u8* host = gpu_memory->GetPointer<u8>(page); host != nullptr &&
-                    Common::NS2FrameTrace::AddWriterPage(reinterpret_cast<uintptr_t>(host), page)) {
-                    LOG_INFO(Render_Vulkan, "NS2 writer trace: t={}us GPU frame {} present {} watching page {:#x} (block {:#x})",
-                             Common::NS2FrameTrace::TraceMicros(),
-                             Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed),
-                             Common::NS2FrameTrace::PresentsReturned().load(std::memory_order_relaxed), page, block);
-                }
-            }
-            LOG_INFO(Render_Vulkan, "NS2 frame trace:     {}: {}", text,
-                     view.id == VideoCommon::NULL_IMAGE_VIEW_ID
-                         ? "no image: " + texture_cache.DescribeImageIndex(view.index, false)
-                         : fmt::format("view {}", view.id.index));
-        }
-        const bool any_null = std::ranges::any_of(handle_trace, [&](const auto& entry) {
-            return views[entry.first].id == VideoCommon::NULL_IMAGE_VIEW_ID;
-        });
-        if (any_null) {
-            // Where the handles of the movie's texture headers are: every bound constant buffer of
-            // every stage, searched for words naming a 1920x1080 / 960x540 header.
-            const std::vector<u32> wanted = texture_cache.MovieSizedHeaders(false);
-            std::string slots;
-            std::string hits;
-            u32 hit_count = 0;
-            for (size_t stage = 0; stage < 5; ++stage) {
-                const auto& stage_cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
-                for (size_t slot = 0; slot < stage_cbufs.size(); ++slot) {
-                    const auto& cbuf{stage_cbufs[slot]};
-                    if (!cbuf.enabled || cbuf.address == 0) {
-                        continue;
-                    }
-                    if (stage == 4) {
-                        slots += fmt::format(" {}:{:#x}+{:#x}", slot, cbuf.address, cbuf.size);
-                    }
-                    const u32 bytes = (std::min)(cbuf.size, 0x10000U);
-                    std::vector<u32> words(bytes / 4);
-                    gpu_memory->ReadBlockUnsafe(cbuf.address, words.data(), words.size() * 4);
-                    for (size_t w = 0; w < words.size() && hit_count < 32; ++w) {
-                        const u32 tic = words[w] & 0xfffff;
-                        const u32 tic_bytes = (words[w] & 0xffffff) % 32 == 0 ? (words[w] & 0xffffff) / 32 : 0;
-                        if ((tic != 0 && std::ranges::find(wanted, tic) != wanted.end()) ||
-                            (tic_bytes != 0 && std::ranges::find(wanted, tic_bytes) != wanted.end())) {
-                            hits += fmt::format(" stage {} slot {} +{:#x} = {:#010x}", stage, slot,
-                                                w * 4, words[w]);
-                            ++hit_count;
-                        }
-                    }
-                }
-            }
-            std::string wanted_text;
-            for (const u32 index : wanted) {
-                wanted_text += fmt::format(" {}", index);
-            }
-            LOG_INFO(Render_Vulkan, "NS2 frame trace:     fragment cbufs:{}", slots);
-            // The fragment program's native code (once per address) and the first 0x200 bytes of
-            // each fragment constant buffer, to see offline how the handles are computed.
-            static std::mutex dump_mutex;
-            static std::vector<u64> dumped;
-            bool dump_program = false;
-            {
-                std::scoped_lock lock{dump_mutex};
-                if (dumped.size() < 6 && std::ranges::find(dumped, ps) == dumped.end()) {
-                    dumped.push_back(ps);
-                    dump_program = true;
-                }
-            }
-            if (dump_program) {
-                constexpr size_t MaxBytes = 0x6000;
-                std::vector<u32> code(MaxBytes / 4);
-                gpu_memory->ReadBlockUnsafe(ps, code.data(), MaxBytes);
-                size_t end = code.size();
-                // Native programs end with a branch to itself after their EXIT (0x947, -16).
-                for (size_t i = 0x80 / 4; i + 3 < code.size(); i += 4) {
-                    if ((code[i] & 0xfff) == 0x947 && code[i + 1] == 0xfffffff0) {
-                        end = i + 4;
-                        break;
-                    }
-                }
-                for (size_t i = 0; i < end; i += 64) {
-                    std::string line;
-                    for (size_t j = i; j < (std::min)(end, i + 64); ++j) {
-                        line += fmt::format("{:08x}", code[j]);
-                    }
-                    LOG_INFO(Render_Vulkan, "NS2 program dump {:#x} +{:#06x}: {}", ps, i * 4, line);
-                }
-                for (size_t slot = 0; slot < 8; ++slot) {
-                    const auto& cbuf{maxwell3d->state.shader_stages[4].const_buffers[slot]};
-                    if (!cbuf.enabled || cbuf.address == 0) {
-                        continue;
-                    }
-                    std::array<u32, 128> words{};
-                    gpu_memory->ReadBlockUnsafe(cbuf.address, words.data(),
-                                                (std::min<size_t>)(cbuf.size, sizeof(words)));
-                    std::string line;
-                    for (const u32 w : words) {
-                        line += fmt::format("{:08x}", w);
-                    }
-                    LOG_INFO(Render_Vulkan, "NS2 cbuf dump {:#x} slot {} at {:#x}: {}", ps, slot,
-                             cbuf.address, line);
-                }
-            }
-            LOG_INFO(Render_Vulkan, "NS2 frame trace:     movie-sized headers:{}; words naming them:{}",
-                     wanted_text, hits.empty() ? " none" : hits);
-        }
-    }
-    if (Common::NS2FrameTrace::WriterPageCount().load(std::memory_order_relaxed) != 0 &&
-        Common::NS2FrameTrace::WriterGpuBudget().load(std::memory_order_relaxed) > 0) {
-        // Writer trace: every draw that reads a constant buffer in a watched page, with what it
-        // reads, in the same time base as the guest writes.
-        for (size_t stage = 0; stage < 5; ++stage) {
-            const auto& stage_cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
-            for (size_t slot = 0; slot < stage_cbufs.size(); ++slot) {
-                const auto& cbuf{stage_cbufs[slot]};
-                if (!cbuf.enabled || cbuf.address == 0 ||
-                    Common::NS2FrameTrace::FindWriterPageGpu(cbuf.address, (std::max)(cbuf.size, 4U)) < 0) {
-                    continue;
-                }
-                if (Common::NS2FrameTrace::WriterGpuBudget().fetch_sub(1, std::memory_order_relaxed) <= 0) {
-                    break;
-                }
-                std::array<u32, 8> words{};
-                gpu_memory->ReadBlockUnsafe(cbuf.address, words.data(), sizeof(words));
-                const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-                const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-                LOG_INFO(Render_Vulkan,
-                         "NS2 writer trace: seq {} draw# {} t={}us GPU frame {} present {} draw vs={:#x} ps={:#x} into {:#x} {}x{} "
-                         "reads stage {} slot {} at {:#x} (size {:#x}):{}",
-                         Common::NS2FrameTrace::NextSequence(),
-                         Common::NS2FrameTrace::DrawsConfigured().load(std::memory_order_relaxed),
-                         Common::NS2FrameTrace::TraceMicros(),
-                         Common::NS2FrameTrace::Frame().load(std::memory_order_relaxed),
-                         Common::NS2FrameTrace::PresentsReturned().load(std::memory_order_relaxed), vs, ps,
-                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height, stage, slot,
-                         cbuf.address, cbuf.size, fmt::format(" {:08x}", fmt::join(words, " ")));
-            }
-        }
     }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};

@@ -7,7 +7,6 @@
 #include <atomic>
 #include <cstdlib>
 
-#include "common/ns2_frame_trace.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -235,15 +234,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             }
             return enabled;
         }();
-        const GPUVAddr second_page_of = g_nx2_ampere ? Nx2SemaphoreMirror(sequence_address) : 0;
-        const GPUVAddr mirror = mirror_releases ? second_page_of : 0;
-        // Yoshi diagnostics (writer trace): follow the second-page word too, so the trace shows
-        // GPFIFO positions landing on their own address.
-        if (second_page_of != 0 && Common::NS2FrameTrace::SemaphoreTraceOn()) [[unlikely]] {
-            Common::NS2FrameTrace::RegisterSemaphoreSlot(
-                sequence_address,
-                reinterpret_cast<uintptr_t>(dma_pusher.memory_manager.GetPointer(sequence_address)));
-        }
+        const GPUVAddr mirror =
+            g_nx2_ampere && mirror_releases ? Nx2SemaphoreMirror(sequence_address) : 0;
         if (mirror != 0) {
             LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
         }
