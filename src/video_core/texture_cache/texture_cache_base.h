@@ -254,6 +254,11 @@ public:
     /// NS2 Book capture: writes the summary and closes the log.
     void NS2BookCaptureFinish();
 
+    /// NS2 Book capture (yoshi-int-build-38): what a graphics texture binding resolved to: the
+    /// image view (type, format, range, size), its image, the sampler (raw TSC words from game
+    /// memory, the sampler table limit, null or not).
+    std::string NS2DescribeSampling(ImageViewId view_id, SamplerId sampler_id, u32 tsc_index);
+
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 

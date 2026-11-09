@@ -2586,20 +2586,37 @@ bool RasterizerVulkan::NS2BookCompositionBefore(const GraphicsPipeline& pipeline
         const u64 size = limit >= start ? (std::min<u64>)(limit - start + 1, 0x4000) : 0x1000;
         write_gpu(fmt::format("{}_vb{}.bin", prefix, stream), start, size);
     }
-    if (is_indexed) {
-        const GPUVAddr start = regs.index_buffer.StartAddress();
-        const GPUVAddr end = regs.index_buffer.EndAddress();
-        write_gpu(prefix + "_ib.bin", start, end > start ? (std::min<u64>)(end - start, 0x4000) : 0);
-    }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    std::string index_text;
+    if (is_indexed) {
+        // NVN leaves the index buffer limit at 0: size the dump from the draw (first + count).
+        const auto& index_buffer = draw_state.index_buffer;
+        const GPUVAddr start = index_buffer.StartAddress();
+        const u64 bytes = u64{index_buffer.first + index_buffer.count} * index_buffer.FormatSizeInBytes();
+        write_gpu(prefix + "_ib.bin", start, (std::min<u64>)(bytes, 0x4000));
+        index_text = fmt::format(" index buffer {:#x} format {} ({} bytes each) limit {:#x}", start,
+                                 static_cast<u32>(index_buffer.format), index_buffer.FormatSizeInBytes(),
+                                 index_buffer.EndAddress());
+        if (start != 0 && bytes != 0 && bytes <= 0x4000 && gpu_memory->IsFullyMappedRange(start, bytes)) {
+            std::vector<u8> indices(bytes);
+            gpu_memory->ReadBlockUnsafe(start, indices.data(), indices.size());
+            index_text += " indices";
+            const u32 size = static_cast<u32>(index_buffer.FormatSizeInBytes());
+            for (u64 i = index_buffer.first; i < u64{index_buffer.first} + (std::min<u32>)(index_buffer.count, 12); ++i) {
+                u32 value = 0;
+                std::memcpy(&value, indices.data() + i * size, size);
+                index_text += fmt::format(" {}", value);
+            }
+        }
+    }
     Capture::Line(fmt::format(
         "#{} COMPOSITION {} ({}{}) topology={} indexed={} vertices first={} count={} indices first={} count={} "
-        "base_instance={} rt0={:#x} {}x{}{}\n    files: {}",
+        "base_instance={} rt0={:#x} {}x{}{}{}\n    files: {}",
         Capture::NextEvent(), prefix, by_hash ? "fragment program" : "", early ? (by_hash ? ", early" : "early") : "",
         static_cast<u32>(draw_state.topology), is_indexed, draw_state.vertex_buffer.first,
         draw_state.vertex_buffer.count, draw_state.index_buffer.first, draw_state.index_buffer.count,
         draw_state.base_instance, regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height, programs,
-        fmt::join(files, " ")));
+        index_text, fmt::join(files, " ")));
     // The render targets before the first captured draw into each colour target 0.
     if (regs.rt[0].Address() != composition.last_rt0) {
         composition.last_rt0 = regs.rt[0].Address();

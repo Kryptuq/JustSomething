@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/ns2_book_capture.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -1082,6 +1083,85 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     return nullptr;
 }
 
+namespace {
+// NS2 Book capture (diagnostics, yoshi-int-build-38): records how the Book composition fragment
+// program was actually built (the SPIR-V given to the driver, the runtime info and the texture
+// metadata read while translating it). Only for that one program.
+void NS2RecordCompositionProgram(const GraphicsPipelineCacheKey& key, size_t index,
+                                 const Shader::Environment& env, const Shader::IR::Program& program,
+                                 const Shader::RuntimeInfo& runtime_info, std::span<const u32> code,
+                                 bool from_disk_cache) {
+    namespace Capture = VideoCommon::NS2BookCapture;
+    // Every stage of a pipeline whose fragment program is the failing one (its vertex program too).
+    if (key.unique_hashes[5] != Capture::FailingCompositionProgram) {
+        return;
+    }
+    const auto dir = Capture::RuntimeProgramDirectory();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string name =
+        fmt::format("{:016x}_stage{}_pipeline{:016x}", key.unique_hashes[index], index, key.Hash());
+    {
+        std::ofstream file(dir / (name + ".spv"), std::ios::binary);
+        file.write(reinterpret_cast<const char*>(code.data()),
+                   static_cast<std::streamsize>(code.size_bytes()));
+    }
+    std::ofstream text(dir / (name + ".txt"), std::ios::trunc);
+    text << fmt::format("program {:016x} stage {} pipeline {:016x} built from {}\n",
+                        key.unique_hashes[index], index, key.Hash(),
+                        from_disk_cache ? "the disk shader cache (environment from file)"
+                                        : "the running game (environment from guest memory)");
+    std::string stores;
+    for (u32 generic = 0; generic < 32; ++generic) {
+        for (u32 element = 0; element < 4; ++element) {
+            if (runtime_info.previous_stage_stores.Generic(generic, element)) {
+                stores += fmt::format(" {}.{}", generic, "xyzw"[element]);
+            }
+        }
+    }
+    text << fmt::format("runtime: previous stage stores generics{}\n", stores);
+    text << fmt::format("runtime: alpha_test_func={} ref={} dual_source_blend={} force_early_z={} "
+                        "convert_depth={} y_negate={}\n",
+                        runtime_info.alpha_test_func ? static_cast<int>(*runtime_info.alpha_test_func) : -1,
+                        runtime_info.alpha_test_reference, runtime_info.dual_source_blend,
+                        runtime_info.force_early_z, runtime_info.convert_depth_mode,
+                        runtime_info.y_negate);
+    for (const auto& desc : program.info.texture_descriptors) {
+        text << fmt::format("info texture: type={} depth={} multisample={} integer={} cbuf{}+{:#x} "
+                            "shl={} secondary={} cbuf{}+{:#x} shl={} count={} size_shift={} "
+                            "handle_program={}\n",
+                            static_cast<u32>(desc.type), desc.is_depth, desc.is_multisample,
+                            desc.is_integer, desc.cbuf_index, desc.cbuf_offset, desc.shift_left,
+                            desc.has_secondary, desc.secondary_cbuf_index, desc.secondary_cbuf_offset,
+                            desc.secondary_shift_left, desc.count, desc.size_shift,
+                            static_cast<s32>(desc.handle_program));
+    }
+    text << fmt::format("info: {} texture buffers, {} image buffers, {} images, {} storage buffers, "
+                        "{} constant buffers, stores frag color0={}\n",
+                        program.info.texture_buffer_descriptors.size(),
+                        program.info.image_buffer_descriptors.size(),
+                        program.info.image_descriptors.size(),
+                        program.info.storage_buffers_descriptors.size(),
+                        program.info.constant_buffer_descriptors.size(),
+                        program.info.stores_frag_color[0]);
+    const auto write_metadata = [&](const auto& types, const auto& formats) {
+        for (const auto& [handle, type] : types) {
+            text << fmt::format("env: handle {:#010x} texture type {}\n", handle, static_cast<u32>(type));
+        }
+        for (const auto& [handle, format] : formats) {
+            text << fmt::format("env: handle {:#010x} pixel format {}\n", handle, static_cast<u32>(format));
+        }
+    };
+    if (const auto* generic = dynamic_cast<const VideoCommon::GenericEnvironment*>(&env)) {
+        write_metadata(generic->NS2TextureTypes(), generic->NS2TexturePixelFormats());
+    } else if (const auto* file = dynamic_cast<const VideoCommon::FileEnvironment*>(&env)) {
+        write_metadata(file->NS2TextureTypes(), file->NS2TexturePixelFormats());
+    }
+    LOG_WARNING(Render_Vulkan, "NS2 Book capture: recorded program {:016x} (pipeline {:016x}, {})",
+                key.unique_hashes[index], key.Hash(), from_disk_cache ? "disk cache" : "runtime");
+}
+} // Anonymous namespace
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -1095,6 +1175,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
+    std::array<Shader::Environment*, Maxwell::MaxShaderProgram> ns2_stage_envs{};
 
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1109,6 +1190,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             continue;
         }
         Shader::Environment& env{*envs[env_index]};
+        ns2_stage_envs[index] = &env;
         ++env_index;
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
@@ -1157,6 +1239,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+        if (ns2_stage_envs[index] != nullptr) [[unlikely]] {
+            if (key.unique_hashes[5] == VideoCommon::NS2BookCapture::FailingCompositionProgram) {
+                NS2RecordCompositionProgram(key, index, *ns2_stage_envs[index], program, runtime_info,
+                                            code, !build_in_parallel);
+            }
+        }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
 

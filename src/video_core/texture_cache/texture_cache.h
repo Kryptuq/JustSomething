@@ -732,6 +732,35 @@ void TextureCache<P>::NS2BookSaveRenderTargets(std::string_view tag) {
 }
 
 template <class P>
+std::string TextureCache<P>::NS2DescribeSampling(ImageViewId view_id, SamplerId sampler_id,
+                                                 u32 tsc_index) {
+    std::string text;
+    if (!view_id) {
+        text = "view: null";
+    } else {
+        const ImageViewBase& view = slot_image_views[view_id];
+        text = fmt::format("view{}: type={} fmt={} levels {}+{} layers {}+{} size {}x{}x{} flags={:#x} -> {}",
+                           view_id.index, static_cast<u32>(view.type), static_cast<u32>(view.format),
+                           view.range.base.level, view.range.extent.levels, view.range.base.layer,
+                           view.range.extent.layers, view.size.width, view.size.height,
+                           view.size.depth, static_cast<u32>(view.flags),
+                           view.image_id ? NS2BookDescribeImage(view.image_id) : std::string{"no image"});
+    }
+    const auto& table = channel_state->graphics_sampler_table;
+    std::string tsc = "out of table";
+    if (tsc_index <= table.current_limit && table.current_gpu_addr != 0) {
+        std::array<u32, 8> words{};
+        gpu_memory->ReadBlockUnsafe(table.current_gpu_addr + u64{tsc_index} * sizeof(words), words.data(),
+                                    sizeof(words));
+        tsc = fmt::format("{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}", words[0],
+                          words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+    return text + fmt::format("\n      sampler id {} ({}) tsc[{}] limit {} @{:#x}: {}", sampler_id.index,
+                              sampler_id == NULL_SAMPLER_ID ? "NULL sampler" : "sampler", tsc_index,
+                              table.current_limit, table.current_gpu_addr, tsc);
+}
+
+template <class P>
 void TextureCache<P>::NS2BookCaptureFinish() {
     namespace Capture = NS2BookCapture;
     if (!ns2_book_open) {

@@ -112,6 +112,14 @@ public:
         return has_hle_engine_state;
     }
 
+    /// NS2 diagnostics (Book capture): texture types and formats read while this program was translated.
+    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TextureType>& NS2TextureTypes() const noexcept {
+        return texture_types;
+    }
+    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TexturePixelFormat>& NS2TexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
+
 protected:
     std::optional<u64> TryFindSize();
 
@@ -261,6 +269,14 @@ public:
     }
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
+
+    /// NS2 diagnostics (Book capture): texture types and formats read while this program was translated.
+    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TextureType>& NS2TextureTypes() const noexcept {
+        return texture_types;
+    }
+    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TexturePixelFormat>& NS2TexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
 
 private:
     std::vector<u64> code;

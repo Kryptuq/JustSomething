@@ -69,9 +69,22 @@ inline int OnFramePresented() {
     return 0;
 }
 
+inline std::filesystem::path BaseDirectory() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_book_capture_yoshi-integration";
+}
+
 inline std::filesystem::path Directory() {
-    return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_book_capture_yoshi-integration" /
-           ("capture" + std::to_string(CaptureNumber().load(std::memory_order_relaxed)));
+    return BaseDirectory() / ("capture" + std::to_string(CaptureNumber().load(std::memory_order_relaxed)));
+}
+
+/// yoshi-int-build-38: the Book composition program that draws nothing in the page image. Its
+/// pipelines are recorded when they are built (runtime_programs/: the SPIR-V the driver gets, the
+/// runtime info and the texture metadata the translation read), and its draws in the capture frame
+/// log the bound texture views and samplers.
+constexpr u64 FailingCompositionProgram = 0x60c4a9ac1580d2bfULL;
+
+inline std::filesystem::path RuntimeProgramDirectory() {
+    return BaseDirectory() / "runtime_programs";
 }
 
 inline std::filesystem::path CompositionDirectory() {
