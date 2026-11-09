@@ -16,7 +16,6 @@
 #include "common/address_space.h"
 #include "common/address_space.inc"
 #include "common/ns2_frame_trace.h"
-#include "common/ns2_rejection_trace.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
@@ -424,7 +423,6 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
     if (!ptr) [[unlikely]] {
         return;
     }
-    Common::NS2RejectionTrace::NoteUnsafeWrite(address, sizeof(T), "device Write");
     Common::NS2FrameTrace::EmulatorWriteNote note{ptr, sizeof(T), address};
     std::memcpy(ptr, &value, sizeof(T));
 }
@@ -531,7 +529,6 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
         [&](const std::size_t copy_amount) {
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
         });
-    const Common::NS2RejectionTrace::SourceScope trace_source{"device WriteBlock (host/HLE)"};
     device_inter->InvalidateRegion(address, size);
 }
 
@@ -581,7 +578,6 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
 template <typename Traits>
 void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* src_pointer,
                                                    size_t size) {
-    Common::NS2RejectionTrace::NoteUnsafeWrite(address, size, "device WriteBlockUnsafe");
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
@@ -779,43 +775,6 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
         ++run_pages;
     }
     release_run();
-}
-
-template <typename Traits>
-std::pair<size_t, VAddr> DeviceMemoryManager<Traits>::DiagnosticCpuBacking(DAddr address) {
-    const size_t page = address >> Memory::YUZU_PAGEBITS;
-    if (tracked_entries[page].compressed_physical_ptr == 0) {
-        return {0, 0};
-    }
-    const auto [asid, vaddress] = ExtractCPUBacking(page);
-    if (vaddress == 0) {
-        return {0, 0};
-    }
-    return {asid.id, vaddress + (address & Memory::YUZU_PAGEMASK)};
-}
-
-template <typename Traits>
-int DeviceMemoryManager<Traits>::DiagnosticSameHostMemory(DAddr address) {
-    const auto [asid, vaddress] = DiagnosticCpuBacking(address);
-    if (vaddress == 0 || asid >= registered_processes.size() ||
-        registered_processes[asid] == nullptr) {
-        return -1;
-    }
-    const u8* const process_pointer =
-        registered_processes[asid]->GetPointerSilent(Common::ProcessAddress(vaddress));
-    return process_pointer != nullptr && process_pointer == GetPointer<u8>(address) ? 1 : 0;
-}
-
-template <typename Traits>
-bool DeviceMemoryManager<Traits>::DiagnosticReadThroughCpu(DAddr address, void* dest_pointer,
-                                                           size_t size) {
-    const auto [asid, vaddress] = DiagnosticCpuBacking(address);
-    if (vaddress == 0 || asid >= registered_processes.size() ||
-        registered_processes[asid] == nullptr) {
-        return false;
-    }
-    return registered_processes[asid]->ReadBlockUnsafe(Common::ProcessAddress(vaddress),
-                                                       dest_pointer, size);
 }
 
 } // namespace Core

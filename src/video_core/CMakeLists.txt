@@ -105,8 +105,6 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
-    ns2_buffer_events.h
-    ns2_rejected_dump.h
     native_qmd.h
     native_query_trace.h
     nx2.h

@@ -6,9 +6,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <exception>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -19,9 +16,6 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
-#include "common/fs/path_util.h"
-#include "common/logging.h"
-#include "common/ns2_rejection_trace.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/object_pool.h"
@@ -31,219 +25,11 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
-#include "video_core/ns2_buffer_events.h"
-#include "video_core/nx2.h"
-#include "video_core/ns2_program_address_trace.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
-
-namespace {
-// Diagnostics only (yint-29): what memory a rejected program's address resolves to.
-std::string DescribeProgramMemory(Tegra::MemoryManager& gpu_memory,
-                                  Tegra::MaxwellDeviceMemoryManager& device_memory, GPUVAddr address) {
-    const std::optional<DAddr> device = gpu_memory.GpuToCpuAddress(address);
-    if (!device) {
-        return fmt::format("GPU {:#x} is not mapped", address);
-    }
-    std::string text = fmt::format("GPU {:#x} -> device {:#x} (page kind {:#x})", address, *device,
-                                   static_cast<u32>(gpu_memory.GetPageKind(address)));
-    if (device_memory.GetPointer<u8>(*device) == nullptr) {
-        return text + ", the device page has NO memory";
-    }
-    std::array<u32, 8> device_view{};
-    device_memory.ReadBlockUnsafe(*device, device_view.data(), sizeof(device_view));
-    const auto [asid, vaddress] = device_memory.DiagnosticCpuBacking(*device);
-    if (vaddress == 0) {
-        return text + fmt::format(", NOT backed by process memory (GPU-only or host memory); device "
-                                  "view {:08x}",
-                                  fmt::join(device_view, " "));
-    }
-    const int same = device_memory.DiagnosticSameHostMemory(*device);
-    std::array<u32, 8> process_view{};
-    const bool read = device_memory.DiagnosticReadThroughCpu(*device, process_view.data(),
-                                                             sizeof(process_view));
-    text += fmt::format(", backed by process {} VA {:#x} which {}; device view {:08x}", asid,
-                        vaddress,
-                        same == 1 ? "maps the same host memory now"
-                                  : "maps OTHER host memory now (remapped since the GPU mapping)",
-                        fmt::join(device_view, " "));
-    if (same != 1) {
-        text += read ? fmt::format("; process view {:08x}", fmt::join(process_view, " "))
-                     : std::string{"; process view unreadable"};
-    }
-    return text;
-}
-
-std::string DescribeAddressWrite(Tegra::MemoryManager& gpu_memory, size_t stage, bool high, u32 value) {
-    namespace Trace = VideoCommon::NS2ProgramAddressTrace;
-    const Trace::Provenance provenance = Trace::Find(stage, high, value);
-    const auto now = Trace::Clock::now();
-    const auto ago = [&](Trace::Clock::time_point time) {
-        return std::chrono::duration<double, std::milli>(now - time).count();
-    };
-    std::string text = fmt::format("{} {:#x}: ", high ? "high" : "low", value);
-    if (const auto& parsed = provenance.parsed) {
-        if (parsed->address == 0) {
-            text += fmt::format("parsed from an inline header ({}), ch {}, {:.1f} ms ago", parsed->source,
-                                parsed->channel, ago(parsed->time));
-        } else {
-            u32 live{};
-            gpu_memory.ReadBlockUnsafe(parsed->address, &live, sizeof(live));
-            text += fmt::format("parsed from word {:#x} ({}), ch {}, {:.1f} ms ago; that word holds {:#x} "
-                                "now{}",
-                                parsed->address, parsed->source, parsed->channel, ago(parsed->time),
-                                live, live == value ? " (same)" : " (CHANGED)");
-        }
-    } else {
-        text += fmt::format("NOT parsed from a command word among the last {} writes",
-                            provenance.parsed_count);
-    }
-    if (const auto& stored = provenance.stored) {
-        text += stored->macro != 0
-                    ? fmt::format("; stored by macro {:#x} (segment {:#x})", stored->macro, stored->address)
-                    : fmt::format("; stored directly (segment {:#x})", stored->address);
-    } else {
-        text += "; no register store of this value seen";
-    }
-    return text;
-}
-
-// Diagnostics only (yoshi-int-build-33): where a rejected native program's address came from.
-// For the value stored in each half of the stage's program address: the macro call that stored it
-// (parameters, the GPU address and copy they were read from, whether those words still hold them,
-// the registers the macro read), the slot's earlier stores, whether a program was ever built at
-// this address, the copy-engine copies and inline uploads into the program's memory, its
-// GPU-written pages and the latest MME DMA reads. The engine's MME data RAM at the store and the
-// macro code are written to <log dir>/ns2_macro_yoshi-integration/ for offline replay.
-void ReportProgramAddressOrigin(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
-                                size_t stage, GPUVAddr program, u32 high, u32 low) {
-    namespace Trace = VideoCommon::NS2ProgramAddressTrace;
-    static u32 report_number = 0;
-    const u32 number = ++report_number;
-    const auto now = Trace::Clock::now();
-    const auto ago = [&](Trace::Clock::time_point time) {
-        return std::chrono::duration<double, std::milli>(now - time).count();
-    };
-    const auto built = Trace::FindBuilt(program);
-    LOG_INFO(HW_GPU, "NS2 address origin #{}: program {:#x} stage {} (high {:#x}, low {:#x}); {}", number,
-             program, stage, high, low,
-             built ? fmt::format("a program was built at this address {} times, last {:.1f} ms ago (hash {:016x})",
-                                 built->count, ago(built->time), built->hash)
-                   : std::string{"no program was ever built at this address"});
-    for (const bool is_high : {true, false}) {
-        const u32 value = is_high ? high : low;
-        const auto history = Trace::StoredHistory(stage, is_high);
-        std::string earlier;
-        bool detailed = false;
-        for (const auto& write : history) {
-            if (write.value != value || detailed) {
-                earlier += fmt::format(" {:#x}@{:.1f}ms{}", write.value, ago(write.time),
-                                       write.macro ? fmt::format("(m{:#x})", write.macro) : std::string{});
-                continue;
-            }
-            detailed = true;
-            std::string reads;
-            for (u32 i = 0; i < write.read_count; ++i) {
-                reads += fmt::format(" r{:#x}={:#x}", write.reads[i].method, write.reads[i].value);
-            }
-            std::string params_now = "not checked";
-            if (write.param_address != 0 && write.param_count != 0) {
-                std::array<u32, 32> live{};
-                gpu_memory.ReadBlockUnsafe(write.param_address, live.data(), write.param_count * sizeof(u32));
-                params_now = std::equal(live.begin(), live.begin() + write.param_count, write.params.begin())
-                                 ? "same"
-                                 : fmt::format("CHANGED: {:08x}",
-                                               fmt::join(std::span{live}.first(write.param_count), " "));
-            }
-            LOG_INFO(HW_GPU,
-                     "NS2 address origin #{}: {} {:#x} stored {:.1f} ms ago by {}; {} parameters {:08x} read "
-                     "from {:#x} ({}), those words now: {}; registers read:{}",
-                     number, is_high ? "high" : "low", value, ago(write.time),
-                     write.macro ? fmt::format("macro {:#x}", write.macro) : std::string{"a direct method"},
-                     write.param_count, fmt::join(std::span{write.params}.first(write.param_count), " "),
-                     write.param_address, write.param_source ? write.param_source : "?", params_now,
-                     reads.empty() ? std::string{" none (or a memoized call)"} : reads);
-        }
-        LOG_INFO(HW_GPU, "NS2 address origin #{}: {} stores of this slot, newest first:{}{}", number,
-                 is_high ? "high" : "low", earlier.empty() ? std::string{" none other"} : earlier,
-                 detailed ? "" : " (the current value is NOT among the remembered stores)");
-    }
-    // Who wrote the program's memory (0x16000 bytes from the address).
-    constexpr u64 Range = 0x16000;
-    std::string writers;
-    u32 shown = 0;
-    for (const auto& write : Trace::WritesOverlapping(program, Range)) {
-        if (++shown > 12) break;
-        writers += fmt::format(" [{} {:#x}+{:#x} from {:#x}{} {:.1f}ms ago]", write.kind, write.destination,
-                               write.size, write.source, write.source_gpu ? " (GPU-written source)" : "",
-                               ago(write.time));
-    }
-    u32 gpu_pages = 0, pages = 0;
-    for (GPUVAddr page = program & ~GPUVAddr{0xfff}; page < program + Range; page += 0x1000, ++pages) {
-        if (const auto device = gpu_memory.GpuToCpuAddress(page); device && Tegra::Nx2IsGpuWritten(*device)) {
-            ++gpu_pages;
-        }
-    }
-    LOG_INFO(HW_GPU, "NS2 address origin #{}: memory {:#x}+{:#x}: {} of {} pages GPU-written; copies/uploads "
-             "into it (of the last 1024):{}",
-             number, program, Range, gpu_pages, pages, writers.empty() ? std::string{" none"} : writers);
-    std::string dma;
-    shown = 0;
-    for (const auto& read : Trace::DmaReads()) {
-        if (++shown > 8) break;
-        dma += fmt::format(" [m{:#x} {:#x} -> {} {:#x} x{}{} {:08x} {:.1f}ms ago]", read.macro, read.source,
-                           read.fifoed ? "fifo" : "ram", read.ram, read.count, read.flushed ? " flushed" : "",
-                           fmt::join(read.words, " "), ago(read.time));
-    }
-    LOG_INFO(HW_GPU, "NS2 address origin #{}: latest MME DMA reads:{}", number,
-             dma.empty() ? std::string{" none"} : dma);
-    // D4 (yoshi-int-build-34): the GPU caches' view of the program's first 4 KiB before and after
-    // a flush like the one the shader loader's ReadBlock does, and the buffer cache events that
-    // touched it.
-    if (const auto device = gpu_memory.GpuToCpuAddress(program)) {
-        namespace Events = VideoCommon::NS2BufferEvents;
-        constexpr u64 Window = 0x1000;
-        auto& rasterizer = maxwell3d.Rasterizer();
-        LOG_INFO(HW_GPU, "NS2 address origin #{}: D4 before flush, device {:#x}+{:#x}: {}", number, *device,
-                 Window, rasterizer.NS2DescribeGpuRange(*device, Window));
-        Events::ThreadDownloadedBytes() = 0;
-        gpu_memory.FlushRegion(program, Window);
-        LOG_INFO(HW_GPU, "NS2 address origin #{}: D4 the flush downloaded {:#x} bytes; after: {}", number,
-                 Events::ThreadDownloadedBytes(), rasterizer.NS2DescribeGpuRange(*device, Window));
-        std::string events;
-        const u64 now_us = Events::NowMicros();
-        for (const auto& event : Events::Overlapping(*device, Range, 24)) {
-            events += fmt::format(" [{:.1f}ms ago {} {:#x}+{:#x} (buffer_cache.h:{})]",
-                                  static_cast<double>(now_us - event.time_us) / 1000.0, Events::Name(event.kind),
-                                  event.address, event.size, event.line);
-        }
-        LOG_INFO(HW_GPU, "NS2 address origin #{}: D4 buffer cache events on {:#x}+{:#x} (ring covers {:.1f} ms), newest first:{}",
-                 number, *device, Range, static_cast<double>(Events::RingSpanMicros()) / 1000.0,
-                 events.empty() ? std::string{" none"} : events);
-    }
-    // Data RAM at the low word's store, and (once) the macro code, for offline replay.
-    std::error_code ec;
-    const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_macro_yoshi-integration";
-    std::filesystem::create_directories(dir, ec);
-    for (const bool is_high : {true, false}) {
-        const auto data_ram = Trace::DataRamAtStore(stage, is_high);
-        std::ofstream file(dir / fmt::format("{:03}_{:x}_stage{}_{}_dataram.bin", number, program, stage,
-                                             is_high ? "high" : "low"),
-                           std::ios::binary);
-        file.write(reinterpret_cast<const char*>(data_ram.data()), sizeof(data_ram));
-    }
-    static bool code_saved = false;
-    if (!code_saved) {
-        code_saved = true;
-        const auto& code = maxwell3d.GetNativeMacroEngine().native_code;
-        std::ofstream file(dir / "macro_code.bin", std::ios::binary);
-        file.write(reinterpret_cast<const char*>(code.data()), sizeof(code));
-    }
-}
-} // Anonymous namespace
 
 void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
     std::scoped_lock lock{invalidation_mutex};
@@ -333,7 +119,6 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
             // without rethrowing (two C++ throws each time cost ~1-2% of the GPU thread).
             maxwell3d->GetNativeMacroEngine().native_execution_failed = true;
             last_shaders_valid = false;
-            Common::NS2RejectionTrace::NoteSkip(*cpu_shader_addr);
             return false;
         }
         if (!shader_info) {
@@ -345,10 +130,6 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 ResetLastNativeCapture();
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
-                Common::NS2RejectionTrace::OnBuilt(*cpu_shader_addr);
-                if (native) {
-                    VideoCommon::NS2ProgramAddressTrace::NoteBuilt(shader_addr, shader_info->unique_hash);
-                }
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
@@ -361,18 +142,6 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     std::memcpy(config.data(), &shader_config, sizeof(config));
                     LOG_ERROR(HW_GPU, "Rejected program {:#x} is bound to stage {}: header {:08x}, slot {:08x}",
                               shader_addr, index, fmt::join(header, " "), fmt::join(config, " "));
-                    // Diagnostics only (yint-29): where the address came from, what it maps to.
-                    LOG_INFO(HW_GPU, "Program address trace: {:#x} stage {}: {} | {} | memory: {}",
-                             shader_addr, index,
-                             DescribeAddressWrite(*gpu_memory, index, true, shader_config.reserved[0]),
-                             DescribeAddressWrite(*gpu_memory, index, false, shader_config.reserved[1]),
-                             DescribeProgramMemory(*gpu_memory, device_memory, shader_addr));
-                }
-                // Diagnostics only (yint-33): every rejection of a program (up to 8 per address,
-                // 64 in all), since the memory behind the hot addresses keeps changing.
-                if (native && VideoCommon::NS2ProgramAddressTrace::TakeReport(shader_addr, 8, 64)) {
-                    ReportProgramAddressOrigin(*maxwell3d, *gpu_memory, index, shader_addr,
-                                               shader_config.reserved[0], shader_config.reserved[1]);
                 }
                 throw;
             }
@@ -431,20 +200,9 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         RethrowIfRejected(*cpu_shader_addr);
         ResetLastNativeCapture();
         ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-        const ShaderInfo* const built = MakeShaderInfo(env, *cpu_shader_addr);
-        Common::NS2RejectionTrace::OnBuilt(*cpu_shader_addr);
-        return built;
+        return MakeShaderInfo(env, *cpu_shader_addr);
     } catch (const Shader::Exception&) {
         RememberRejection(*cpu_shader_addr);
-        // Diagnostics only (yint-29): the QMD the program came from and what its address maps to.
-        static std::unordered_set<GPUVAddr> described;
-        if (described.size() < 64 && described.insert(shader_addr).second) {
-            LOG_INFO(HW_GPU,
-                     "Program address trace: compute {:#x} = code {:#x} + program start {:#x} (QMD "
-                     "{:#x}) | memory: {}",
-                     shader_addr, program_base, qmd.program_start, kepler_compute->NativeQmdAddress(),
-                     DescribeProgramMemory(*gpu_memory, device_memory, shader_addr));
-        }
         throw;
     }
 }
@@ -474,8 +232,6 @@ void ShaderCache::RememberRejection(VAddr addr) {
     {
         std::scoped_lock lock{rejected_mutex};
         if (!rejected_native.emplace(addr, rejection).second) {
-            // Already rejected (compute dispatches come here on every launch).
-            Common::NS2RejectionTrace::NoteSkip(addr);
             return;
         }
         rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), rejection.begin),
@@ -485,15 +241,6 @@ void ShaderCache::RememberRejection(VAddr addr) {
                                std::memory_order_relaxed);
     }
     device_memory.UpdatePagesCachedCount(rejection.begin, rejection.size, 1);
-    std::string what;
-    try {
-        std::rethrow_exception(rejection.error);
-    } catch (const std::exception& error) {
-        what = error.what();
-    } catch (...) {
-        what = "unknown exception";
-    }
-    Common::NS2RejectionTrace::OnRejected(addr, rejection.begin, rejection.size, what);
 }
 
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
@@ -560,7 +307,6 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
                     return false;
                 }
                 untracked.emplace_back(rejection.begin, rejection.size);
-                Common::NS2RejectionTrace::OnLifted(rejected.first, addr, addr_end - addr);
                 return true;
             });
         }

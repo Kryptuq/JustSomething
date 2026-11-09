@@ -13,7 +13,6 @@
 #include <utility>
 
 #include "common/assert.h"
-#include "common/ns2_rejection_trace.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -115,8 +114,6 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            const Common::NS2RejectionTrace::SourceScope trace_source{
-                "CPU write, invalidation deferred and gathered later (GPU-modified page)"};
             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
         });
         system.GatherGPUDirtyMemory(callback_writes);

@@ -11,8 +11,6 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
-#include "video_core/ns2_program_address_trace.h"
-#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 
@@ -71,14 +69,6 @@ void State::ProcessData(const u32* data, size_t num_data) {
 
 void State::ProcessData(std::span<const u8> read_buffer) {
     const GPUVAddr address{regs.dest.Address()};
-    // Diagnostics only (yint-33): inline uploads into GPU memory (see maxwell_dma.cpp).
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-        VideoCommon::NS2ProgramAddressTrace::NoteMemoryWrite(
-            is_linear ? "inline upload" : "inline upload (block linear)", address,
-            is_linear ? u64{regs.line_count ? regs.line_count - 1 : 0} * regs.dest.pitch + regs.line_length_in
-                      : u64{regs.line_count} * regs.line_length_in,
-            0, false);
-    }
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {
             const GPUVAddr dest_line = address + line * regs.dest.pitch;
