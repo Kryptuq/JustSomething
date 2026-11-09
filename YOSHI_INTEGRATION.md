@@ -495,3 +495,11 @@ right colour offline. This build records how that program is built at runtime (S
 texture metadata; runtime_programs/) and which image view and sampler its draws bind, plus the index
 data of the composition draws. Ctrl+P while the Book is visible, as before. (Build 38 had an
 unsafe dynamic_cast without RTTI in the recording; build 39 fixes it, same diagnostics.)
+
+## yoshi-int-build-40: Book fix (stale disk pipeline cache)
+yoshi-int-build-39: the Book composition draws use pipeline e052898021e6fc2c, loaded from the disk
+shader cache, whose fragment shader (60c4a9ac1580d2bf) has no colour output; the same shader in another
+cached pipeline and compiled from game memory is correct. The user confirmed: with "Use persistent
+pipeline cache" off the Book renders.
+- Fix: CACHE_VERSION 20 -> 21, so existing caches are discarded and rebuilt once (first run stutters
+  while shaders compile again). No rendering logic changed.
