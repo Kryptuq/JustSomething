@@ -102,7 +102,7 @@ jobs:
           prerelease: true
           files: eden-ns2-windows-x64.zip
           body: |
-            Windows x64 test build of the EdenNS2 branch fix/green-hat (Ocarina of Time work on top of Main Build 124): Eglantine (Djihads80/Eglantine nx2) with the EdenNS2 Yoshi fixes, built from ${{ github.sha }}. Builds 1-123 were based on Eden master (tag edenns2-classic).
+            Windows x64 test build of the EdenNS2 development branch fix/green-hat: Eglantine (Djihads80/Eglantine nx2, v0.1.0-rc3 from green-hat-build-2 on) with the EdenNS2 Yoshi fixes, built from ${{ github.sha }}. Notes: NS2_PATCH_NOTES.md.
 
             Unzip and run `eglantine.exe` (single file, Qt built in). If Windows reports a missing MSVCP140/VCRUNTIME140 DLL, install the Microsoft Visual C++ Redistributable (x64).
             Optional portable mode: create an empty `user` folder next to `eglantine.exe` to keep settings, keys and logs there instead of %APPDATA%\eden.

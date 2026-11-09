@@ -826,3 +826,40 @@ CI: new workflow "Build Windows (Ocarina fix/green-hat)" (push to fix/green-hat 
 release green-hat-build-N); main's workflow and numbering are unchanged.
 Verification: the touched kernel files compile with -Wall -Wextra -Wshadow (Linux, GCC 13);
 Windows CI builds the release. Runtime: to be tested by the user.
+
+## Branch fix/green-hat — green-hat-build-2 (Eglantine v0.1.0-rc3 + Yoshi on Build 124 code)
+fix/green-hat is now our own development branch on the latest Eglantine. User result of
+green-hat-build-1: Ocarina of Time gets past boot (WaitIfEqual64 confirmed); in that log 80 Ocarina
+shaders were still rejected (extended integer compare, texture gather, matrix multiply, indexed
+constant loads, ...), which rc3 targets.
+
+Merge 66124821: Djihads80/Eglantine nx2 v0.1.0-rc3 (78743f30c, = nx2 head on 2026-11-09). It already
+contains b6706b0c. Conflicts resolved exactly as in yoshi-int-build-42 (22112745); the source tree
+equals that merge.
+
+yoshi-int-build-42 (the same merge) regressed Yoshi: stutter on the title screen and in cutscenes,
+ghosting back. Audit (code reading):
+- Kept and effective in 42: semaphore mirror off (7307537a, title/movie flicker), fence downloads
+  (c6e552ef, gameplay flicker), LDGSTS predicate (90826d30, ghosting fix: upstream's LDGSTS form
+  and ours are disjoint, Yoshi's DLSS kernel takes ours), NS2_HMMA matrix maths, cache >= 21.
+- Lost in 42: our native program capture for Yoshi's linked CALL.REL.NOINC calls (7f38c36c) was
+  replaced by upstream's bb5998f4 (from Lichii, for Ocarina), and every Yoshi program was lowered
+  "upstream first". The lowered code changed, so Yoshi's pipeline cache no longer matched and was
+  rebuilt during play (most likely the stutter), and the DLSS network was translated differently
+  from the verified Build 124 code (the ghosting; exact cause not isolated without a 42 log).
+- New in 42 and absent in Build 124: a DLSS replacement chain (Fortune's Weave layout), a skip
+  window of up to 32 compute dispatches after a one-image pass at +0x58 (any title), matrix
+  multiply stand-ins, inline CPU writes onto GPU-written pages.
+
+Fix 47fa42d4 (Yoshi only, title 0400245021D2C000 / demo 04007C6028AA8000): native programs are
+captured and lowered with Build 124's code, kept verbatim in
+src/shader_recompiler/frontend/ampere/build124/; the four runtime heuristics above are off for it.
+All other titles use rc3 with our fallbacks. Expected: Yoshi's lowered programs are the same as in
+Build 124, so its existing pipeline cache is kept (re-translated once at boot).
+Not pinned (shared with all titles): upstream's IR passes (storage-buffer tracking), SPIR-V
+backend, translator fixes (SHR clamp, partial SUST masks, nested returns), buffer/texture cache and
+GPU-thread changes. Note: c6e552ef downloads every GPU write at fences for all titles, which
+bypasses upstream's selective downloads (an Ocarina performance cost; can be scoped later).
+Tests: Build 124's own lowering tests run against the pinned code (build124_*.cpp, all pass); the
+25 upstream/merged shader tests pass; touched files compile with -Wall -Wextra -Wshadow.
+Tip: restart the emulator between Yoshi and another game (the Yoshi mode stays on for the session).
