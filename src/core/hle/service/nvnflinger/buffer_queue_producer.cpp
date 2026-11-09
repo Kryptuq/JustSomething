@@ -393,15 +393,6 @@ Status BufferQueueProducer::DetachNextBuffer(std::shared_ptr<GraphicBuffer>* out
     return Status::NoError;
 }
 
-std::optional<Fence> BufferQueueProducer::GetReleasedBufferFence(s32 slot) {
-    const std::scoped_lock lock{core->mutex};
-    if (slot < 0 || static_cast<size_t>(slot) >= slots.size() ||
-        slots[slot].buffer_state != BufferState::Free) {
-        return std::nullopt;
-    }
-    return slots[slot].fence;
-}
-
 Status BufferQueueProducer::AttachBuffer(s32* out_slot,
                                          const std::shared_ptr<GraphicBuffer>& buffer) {
     if (out_slot == nullptr) {
@@ -437,9 +428,6 @@ Status BufferQueueProducer::AttachBuffer(s32* out_slot,
     slots[*out_slot].buffer_state = BufferState::Dequeued;
     slots[*out_slot].fence = Fence::NoFence();
     slots[*out_slot].request_buffer_called = true;
-    // As in Android's attachBuffer: the consumer has not seen this buffer yet, so the next
-    // acquire must hand it over instead of letting the consumer reuse its cached slot buffer.
-    slots[*out_slot].acquire_called = false;
 
     return return_flags;
 }

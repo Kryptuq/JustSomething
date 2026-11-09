@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/assert.h"
+#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -13,7 +14,9 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
+#include "video_core/macro.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 
 namespace Tegra::Control {
 namespace {
@@ -21,15 +24,30 @@ namespace {
 // Match NVK/Nouveau's initial pushbuffer subchannel layout.
 constexpr u32 Nvk3DSubchannel = 0;
 constexpr u32 NvkComputeSubchannel = 1;
+constexpr u32 NvkM2mfSubchannel = 2;
 constexpr u32 Nvk2DSubchannel = 3;
 constexpr u32 NvkCopySubchannel = 4;
+
+// Switch 2 channels of a process share one TSG, whose graphics context holds the macro RAM.
+std::shared_ptr<NativeMacroContext> Nx2MacroContext() {
+    static const auto context = [] {
+        auto created = std::make_shared<NativeMacroContext>();
+        created->engine.native_turing = true;
+        created->compute_engine.native_turing = true;
+        return created;
+    }();
+    return context;
+}
 
 void BindNvkDefaultSubchannels(ChannelState::Payload& payload) {
     auto& dma_pusher = payload.dma_pusher;
     dma_pusher.BindSubchannel(&payload.maxwell_3d, Nvk3DSubchannel, Engines::EngineTypes::Maxwell3D);
     dma_pusher.BindSubchannel(&payload.kepler_compute, NvkComputeSubchannel,
                               Engines::EngineTypes::KeplerCompute);
-    // Subchannel 2 is M2MF there; Eden does not expose a 0x9039 engine yet.
+    // Subchannel 2 is M2MF/inline-to-memory there (NVN uses it without binding a class);
+    // KeplerMemory has the same LINE_LENGTH_IN/OFFSET_OUT/LAUNCH_DMA/LOAD_INLINE_DATA layout.
+    dma_pusher.BindSubchannel(&payload.kepler_memory, NvkM2mfSubchannel,
+                              Engines::EngineTypes::KeplerMemory);
     dma_pusher.BindSubchannel(&payload.fermi_2d, Nvk2DSubchannel, Engines::EngineTypes::Fermi2D);
     dma_pusher.BindSubchannel(&payload.maxwell_dma, NvkCopySubchannel,
                               Engines::EngineTypes::MaxwellDMA);
@@ -54,9 +72,24 @@ ChannelState::ChannelState(s32 bind_id_)
 void ChannelState::Init(Core::System& system, u64 program_id_) {
     ASSERT(memory_manager);
     program_id = program_id_;
+    // Yoshi and the Mysterious Book (full version, demo): its upscaling passes use HMMA, which is
+    // lowered to NS2_HMMA for it by default (EdenNS2 main); other titles keep the opt-in.
+    if (program_id == 0x0400245021D2C000ULL || program_id == 0x04007C6028AA8000ULL) {
+        Shader::Ampere::NativeTensorByDefault().store(true, std::memory_order_relaxed);
+    }
     payload.emplace(system, *memory_manager, *this);
-    payload->maxwell_3d.SetNativeMacroContext(native_macro_context);
     BindNvkDefaultSubchannels(*payload);
+    if (g_nx2_ampere) {
+        // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its
+        // block-linear surfaces the console's GOB swizzle.
+        memory_manager->EnableNativeTiling();
+        const auto macros = Nx2MacroContext();
+        payload->maxwell_3d.SetNativeMacroContext(macros);
+        payload->maxwell_3d.SetNativeTuringMacroMode(true);
+        payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
+                                                   macros.get());
+        payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
+    }
     initialized = true;
 }
 

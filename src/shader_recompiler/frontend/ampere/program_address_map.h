@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <utility>
-#include <span>
 #include <vector>
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/reg.h"
@@ -29,7 +29,6 @@ inline std::optional<u32> NativeProgramAddress(std::span<const u64> code, u32 ad
     if (target < 0x50 || target >= start * 8 || target % 8 || target % 32 == 0) return {};
     return static_cast<u32>(target);
 }
-
 // Register redirections of lowered instructions, stored as unreachable data in front of the
 // address map: one word per redirected register, (address << 32) | (from << 8) | to.
 constexpr u64 NativeRegisterRemapMagic = 0x50414d4552474552ULL;

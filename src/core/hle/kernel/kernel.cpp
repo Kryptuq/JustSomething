@@ -22,6 +22,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
+#include "core/device_memory.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hardware_properties.h"
@@ -78,7 +79,7 @@ struct KernelCore::Impl {
     // And we have the guarantee that the data won't move out of the way so we can safely
     // take a reference to it. This isn't always universally true but this is "global" data
     // so it will be statically given a TLS slot anyways.
-    static inline thread_local ThreadLocalData tls_data = {};
+    static thread_local ThreadLocalData tls_data;
 
     explicit Impl(Core::System& system_, KernelCore& kernel_) : system{system_} {
         tls_data.lock = true;
@@ -120,13 +121,13 @@ struct KernelCore::Impl {
     }
 
     void TerminateAllProcesses() {
-        auto& kernel = system.Kernel();
-        // Applet cleanup can remove processes while termination waits for its threads.
-        auto processes = kernel.GetProcessList();
-        for (auto& process : processes) {
-            process->Terminate(kernel);
-            kernel.RemoveProcess(process.GetPointerUnsafe());
+        std::scoped_lock lk{process_list_lock};
+        for (auto& process : process_list) {
+            process->Terminate(system.Kernel());
+            process->Close(system.Kernel());
+            process = nullptr;
         }
+        process_list.clear();
     }
 
     void Shutdown(KernelCore& kernel) {
@@ -138,8 +139,21 @@ struct KernelCore::Impl {
         CloseServices();
 
         if (application_process) {
+            // A process still referenced here is never finalized, so its memory stays mapped in
+            // the fastmem arena, and the next game's mappings at the same addresses failed: it ran
+            // on the old game's memory and crashed or hung at boot (a Switch 2 game left its
+            // process with 55-60 references). Detach the process from the arena, so a late
+            // finalize can't unmap the next game's memory, and clear the arena.
+            const u32 references = application_process->GetReferenceCount();
+            application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
             application_process->Close(system.Kernel());
             application_process = nullptr;
+            if (references > 1) {
+                LOG_WARNING(Kernel, "Application process still had {} references at shutdown",
+                            references);
+            }
+            auto& arena = system.DeviceMemory().buffer;
+            arena.Unmap(0, arena.VirtualSize(), false);
         }
 
         next_object_id = 0;
@@ -171,7 +185,7 @@ struct KernelCore::Impl {
             schedulers[core_id].reset();
         }
 
-        // Next host thead ID to use, 0-3 IDs represent core threads, >3 represent others
+        // Next host thead ID to use, IDs below NUM_CPU_CORES represent core threads, the rest others
         next_host_thread_id = Core::Hardware::NUM_CPU_CORES;
 
         // Close kernel objects that were not freed on shutdown
@@ -846,6 +860,8 @@ struct KernelCore::Impl {
     // System context
     Core::System& system;
 };
+
+thread_local ThreadLocalData KernelCore::Impl::tls_data{};
 
 KernelCore::KernelCore(Core::System& system) : impl{std::make_unique<Impl>(system, *this)} {}
 KernelCore::~KernelCore() = default;

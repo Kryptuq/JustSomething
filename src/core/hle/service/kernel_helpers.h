@@ -7,7 +7,6 @@
 #pragma once
 
 #include <string>
-#include <string_view>
 
 namespace Core {
 class System;
@@ -17,13 +16,10 @@ namespace Kernel {
 class KernelCore;
 class KEvent;
 class KProcess;
+class KReadableEvent;
 } // namespace Kernel
 
 namespace Service::KernelHelpers {
-
-/// Debug names of service-created events (for diagnostics only).
-void NameEventForDebugging(const Kernel::KEvent* event, std::string_view name);
-std::string EventNameForDebugging(const Kernel::KEvent* event);
 
 class ServiceContext {
 public:
@@ -34,9 +30,15 @@ public:
 
     void CloseEvent(Kernel::KEvent* event);
 
+    /// Name an event was created with (debugger handle listing); empty when unknown.
+    static std::string GetEventName(const Kernel::KEvent* event);
+
     Kernel::KernelCore& kernel;
     Kernel::KProcess* process{};
     bool process_created{false};
 };
+
+/// The name a service gave an event (EDEN_NX2_SVC_TRACE shows the handles a thread waits on).
+std::string DebugEventName(const Kernel::KReadableEvent* event);
 
 } // namespace Service::KernelHelpers

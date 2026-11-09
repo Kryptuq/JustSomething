@@ -43,9 +43,17 @@ public:
                            u64 big_page_bits_ = 16, u64 page_bits_ = 12);
     ~MemoryManager();
 
+    // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
-    void EnableNativeTiling() { native_tiling = true; }
-    bool UsesNativeTiling() const { return native_tiling; }
+    static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
+
+    /// Switch 2 lays out block-linear surfaces with the console's GOB swizzle.
+    void EnableNativeTiling() {
+        native_tiling = true;
+    }
+    bool UsesNativeTiling() const {
+        return native_tiling;
+    }
     bool IsShuttingDown() const;
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
@@ -156,6 +164,12 @@ public:
                                size_t max_size = (std::numeric_limits<size_t>::max)()) const;
 
     void FlushCaching();
+
+    /// Leaves the caches' invalidation of a range already written for the next FlushCaching
+    /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
+    void AccumulateInvalidation(GPUVAddr gpu_addr, std::size_t size) {
+        accumulator.Add(gpu_addr, size);
+    }
 
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);

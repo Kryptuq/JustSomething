@@ -5,14 +5,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <filesystem>
-#include <cctype>
-#include <array>
-#include <bit>
-#include <cmath>
-#include <cstdlib>
-#include <initializer_list>
-#include <string>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -26,12 +18,11 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
-#include "video_core/ns2_draw_stats.h"
+#include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
-#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
 
@@ -144,6 +135,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
+        // Nothing reads the module once the pipeline exists; the driver keeps its SPIR-V while it
+        // lives.
+        spv_module.reset();
         std::scoped_lock lock{build_mutex};
         is_built = true;
         build_condvar.notify_one();
@@ -156,82 +150,6 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     } else {
         func();
     }
-}
-
-namespace {
-// NS2 diagnostics: logs the contents of a small storage buffer the next dispatch reads, after
-// downloading data the host GPU wrote to it, with NaN/Inf counts for 32- and 16-bit floats.
-// EDEN_NS2_SSBO_PEEK=0 turns it off.
-void LogSmallStorageBuffer(Tegra::MemoryManager& gpu_memory, BufferCache& buffer_cache,
-                           u64 pipeline_hash, GPUVAddr address, u32 size) {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NS2_SSBO_PEEK");
-        return !(value && value[0] == '0');
-    }();
-    constexpr u32 MaxBytes = 0x100;
-    if (!enabled || address == 0 || size > MaxBytes) {
-        return;
-    }
-    if (size == 0) {
-        // No size in the descriptor: the buffer cache binds up to the end of the mapping, show
-        // its start (the producer usually wrote only a few hundred bytes).
-        size = static_cast<u32>((std::min)(gpu_memory.GetMemoryLayoutSize(address), size_t{MaxBytes}));
-    }
-    size &= ~3U;
-    if (size == 0) {
-        return;
-    }
-    const auto device_address = gpu_memory.GpuToCpuAddress(address, size);
-    if (!device_address) {
-        return;
-    }
-    // Waits for the host GPU (only the first runs of each native pipeline get here).
-    buffer_cache.DownloadMemory(*device_address, size);
-    std::array<u32, MaxBytes / 4> words{};
-    gpu_memory.ReadBlockUnsafe(address, words.data(), size);
-    const u32 count = size / 4;
-    u32 nan32 = 0, inf32 = 0, nan16 = 0, inf16 = 0;
-    float max_abs = 0.0f;
-    std::string hex;
-    for (u32 i = 0; i < count; ++i) {
-        const u32 word = words[i];
-        const float value = std::bit_cast<float>(word);
-        if (std::isnan(value)) {
-            ++nan32;
-        } else if (std::isinf(value)) {
-            ++inf32;
-        } else {
-            max_abs = (std::max)(max_abs, std::fabs(value));
-        }
-        for (const u32 half : {word & 0xffffU, word >> 16}) {
-            if ((half & 0x7c00U) == 0x7c00U) {
-                ++((half & 0x3ffU) ? nan16 : inf16);
-            }
-        }
-        hex += fmt::format("{}{:08x}", i % 8 == 0 ? (i == 0 ? "" : " |") : "", word);
-        if (i % 8 != 7 && i + 1 != count) {
-            hex += ' ';
-        }
-    }
-    LOG_INFO(Render_Vulkan,
-             "NS2 storage buffer {:#x}+{:#x} read by pipeline {:016x}: f32 nan {} inf {} max|finite| {}, "
-             "f16 nan {} inf {}: {}",
-             address, size, pipeline_hash, nan32, inf32, max_abs, nan16, inf16, hex);
-}
-} // Anonymous namespace
-
-void ComputePipeline::NS2CaptureAfterDispatch(TextureCache& texture_cache) {
-    if (ns2_capture_after.empty()) {
-        return;
-    }
-    const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_capture";
-    u32 saved = 0;
-    for (const auto& [id, file_name] : ns2_capture_after) {
-        saved += texture_cache.NS2CaptureImageView(id, dir / file_name) ? 1 : 0;
-    }
-    LOG_WARNING(Render_Vulkan, "NS2 capture: pipeline {:016x}: saved {} written images after the dispatch",
-                shader_hash, saved);
-    ns2_capture_after.clear();
 }
 
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
@@ -258,6 +176,19 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
     const auto read_handle{[&](const auto& desc, u32 index) {
+        if (desc.handle_program != ~0U) {
+            // Read by the shader from a storage buffer: computed for this dispatch.
+            return TexturePair(VideoCommon::EvaluateTextureHandle(
+                                   info, desc.handle_program, gpu_memory,
+                                   [&](u32 cbuf) -> GPUVAddr {
+                                       return cbuf < cbufs.size() &&
+                                                      ((qmd.const_buffer_enable_mask >> cbuf) &
+                                                       1) != 0
+                                                  ? cbufs[cbuf].Address()
+                                                  : GPUVAddr{};
+                                   }),
+                               via_header_index);
+        }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
         const u32 index_offset{index << desc.size_shift};
         const u32 offset{desc.cbuf_offset + index_offset};
@@ -305,111 +236,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
-    // NS2 diagnostics: the resources of the first runs of every native compute pipeline, so the
-    // inputs of a dispatch that faults or hangs the host GPU are in the log.
-    const bool native_first_runs = kepler_compute.IsNativeMode() && ns2_traced_runs < 3;
-    if (native_first_runs) {
-        ++ns2_traced_runs;
-    }
-    if (VideoCommon::NS2Draw::FrameTraceActive() || native_first_runs) {
-        // Images in descriptor order: texture buffers, image buffers, sampled, storage ("w" written).
-        std::string described;
-        size_t view_index = 0;
-        const auto describe = [&](size_t count, const char* kind, bool written) {
-            for (size_t i = 0; i < count && view_index < views.size(); ++i, ++view_index) {
-                const auto id = views[view_index].id;
-                described += fmt::format(" {}{}:{}{}", kind, written ? "w" : "",
-                                         texture_cache.DescribeImageView(id),
-                                         id ? texture_cache.GetImageView(id).DescribeHostAddress() : std::string{});
-            }
-        };
-        for (const auto& desc : info.texture_buffer_descriptors) describe(desc.count, "tb", false);
-        for (const auto& desc : info.image_buffer_descriptors) describe(desc.count, "ib", desc.is_written);
-        for (const auto& desc : info.texture_descriptors) describe(desc.count, "t", false);
-        for (const auto& desc : info.image_descriptors) describe(desc.count, "i", desc.is_written);
-        u32 written_buffers = 0;
-        for (const auto& desc : info.storage_buffers_descriptors) written_buffers += desc.is_written ? 1 : 0;
-        if (VideoCommon::NS2Draw::FrameTraceActive()) {
-            LOG_INFO(Render_Vulkan, "NS2 frame trace:   uses {} storage buffers ({} written), shared {} bytes,{}",
-                     info.storage_buffers_descriptors.size(), written_buffers, kepler_compute.launch_description.shared_alloc.Value(),
-                     described.empty() ? std::string{" no images"} : described);
-        }
-        if (native_first_runs) {
-            // Storage buffers as the guest describes them: 64-bit address and 32-bit size in a cbuf.
-            std::string buffers;
-            for (const auto& desc : info.storage_buffers_descriptors) {
-                const GPUVAddr descriptor{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset};
-                buffers += fmt::format(" sb{}:{:#x}+{:#x}", desc.is_written ? "w" : "",
-                                       gpu_memory.Read<u64>(descriptor), gpu_memory.Read<u32>(descriptor + 8));
-            }
-            LOG_INFO(Render_Vulkan,
-                     "NS2 dispatch resources (run {}, pipeline {:016x}, shader {:#x}, grid {}x{}x{}, block {}x{}x{}, shared {}):{}{}",
-                     ns2_traced_runs, shader_hash, kepler_compute.regs.code_loc.Address() + qmd.program_start,
-                     qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
-                     qmd.block_dim_x.Value(), qmd.block_dim_y.Value(), qmd.block_dim_z.Value(),
-                     qmd.shared_alloc.Value(), buffers.empty() ? std::string{" no storage buffers"} : buffers,
-                     described.empty() ? std::string{" no images"} : described);
-            // Small read-only buffers are usually results of earlier GPU work (the DLSS network
-            // output read by the dispatch that hangs): show their contents.
-            for (const auto& desc : info.storage_buffers_descriptors) {
-                if (desc.is_written) {
-                    continue;
-                }
-                const GPUVAddr descriptor{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset};
-                LogSmallStorageBuffer(gpu_memory, buffer_cache, shader_hash, gpu_memory.Read<u64>(descriptor),
-                                      gpu_memory.Read<u32>(descriptor + 8));
-            }
-        }
-    }
-
-    // NS2 diagnostics: one frame capture per session of the images a chosen native compute
-    // pipeline reads and writes, before (and, for written images, after) one of its runs.
-    // EDEN_NS2_CAPTURE_PIPELINE=<hash> (default: the DLSS reconstruction a7e217052ec1940b, 0 = off)
-    // and EDEN_NS2_CAPTURE_RUN=<n> (default 300). Files go to <log dir>/ns2_capture/.
-    if (kepler_compute.IsNativeMode()) {
-        static const u64 capture_pipeline = [] {
-            const char* value = std::getenv("EDEN_NS2_CAPTURE_PIPELINE");
-            return value ? std::strtoull(value, nullptr, 16) : 0xa7e217052ec1940bULL;
-        }();
-        static const u32 capture_run = [] {
-            const char* value = std::getenv("EDEN_NS2_CAPTURE_RUN");
-            const u32 run = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 300U;
-            return run ? run : 1U;
-        }();
-        static std::atomic<bool> captured{false};
-        if (capture_pipeline != 0 && shader_hash == capture_pipeline && ++ns2_capture_runs == capture_run &&
-            !captured.exchange(true)) {
-            std::error_code ec;
-            const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_capture";
-            std::filesystem::create_directories(dir, ec);
-            size_t view_index = 0;
-            u32 saved = 0;
-            const auto capture = [&](size_t count, const char* kind, bool written) {
-                for (size_t i = 0; i < count && view_index < views.size(); ++i, ++view_index) {
-                    const auto id = views[view_index].id;
-                    const std::string name =
-                        fmt::format("{:016x}_run{}_{}{}_{}", shader_hash, capture_run, kind, view_index,
-                                    texture_cache.DescribeImageView(id));
-                    std::string file_name;
-                    for (const char c : name) {
-                        file_name += (std::isalnum(static_cast<unsigned char>(c)) || c == '_') ? c : '-';
-                    }
-                    if (texture_cache.NS2CaptureImageView(id, dir / (file_name + "_before.ns2img"))) {
-                        ++saved;
-                    }
-                    if (written) {
-                        ns2_capture_after.emplace_back(id, file_name + "_after.ns2img");
-                    }
-                }
-            };
-            for (const auto& desc : info.texture_buffer_descriptors) capture(desc.count, "tb", false);
-            for (const auto& desc : info.image_buffer_descriptors) capture(desc.count, "ib", desc.is_written);
-            for (const auto& desc : info.texture_descriptors) capture(desc.count, "t", false);
-            for (const auto& desc : info.image_descriptors) capture(desc.count, "i", desc.is_written);
-            LOG_WARNING(Render_Vulkan, "NS2 capture: pipeline {:016x} run {}: saved {} images before the dispatch to {}",
-                        shader_hash, capture_run, saved, dir.string());
-        }
-    }
 
     buffer_cache.UnbindComputeTextureBuffers();
     size_t index{};

@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <array>
-#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "common/logging.h"
@@ -15,9 +14,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
-#include "video_core/ns2_qmd_watch.h"
 #include "video_core/memory_manager.h"
-#include "video_core/native_query_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -46,7 +43,11 @@ void MaxwellDMA::ConsumeSinkImpl(Core::System& system) {
 }
 
 void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
-    ASSERT_MSG(method < NUM_REGS, "Invalid MaxwellDMA register");
+    if (method >= NUM_REGS) {
+        // Ampere copy (Switch 2) can use methods past this register file; don't write past it.
+        LOG_DEBUG(HW_GPU, "Ignoring MaxwellDMA method {:#x} past the register file", method);
+        return;
+    }
 
     regs.reg_array[method] = method_argument;
 
@@ -62,49 +63,33 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 }
 
 void MaxwellDMA::Launch() {
-    if (memory_manager.UsesNativeTiling()) {
-        const GPUVAddr destination = regs.offset_out;
-        VideoCommon::TraceNativeQuery(10, memory_manager.GetID(), destination,
-            memory_manager.GpuToCpuAddress(destination).value_or(0),
-            regs.line_count, static_cast<GPUVAddr>(regs.offset_in), regs.line_length_in);
-    }
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
-    if (memory_manager.UsesNativeTiling()) {
-        static std::atomic<u32> logged{};
-        const u32 count = logged.fetch_add(1, std::memory_order_relaxed);
-        if (count < 200 || count % 2000 == 0) {
-            const GPUVAddr in = regs.offset_in, out = regs.offset_out;
-            LOG_INFO(HW_GPU, "NS2 trace: DMA #{} {:#x} (cpu {:#x}) -> {:#x} (cpu {:#x}) line={} lines={} "
-                     "src_pitch={} dst_pitch={} multi_line={} src_layout={} dst_layout={} remap={}",
-                     count, in, memory_manager.GpuToCpuAddress(in).value_or(0), out,
-                     memory_manager.GpuToCpuAddress(out).value_or(0), regs.line_length_in, regs.line_count,
-                     regs.pitch_in, regs.pitch_out, static_cast<u32>(regs.launch_dma.multi_line_enable.Value()),
-                     static_cast<u32>(regs.launch_dma.src_memory_layout.Value()),
-                     static_cast<u32>(regs.launch_dma.dst_memory_layout.Value()),
-                     static_cast<u32>(regs.launch_dma.remap_enable.Value()));
+    // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
+    static const u64 trace_destination = [] {
+        const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    if (trace_destination != 0 && GPUVAddr(regs.offset_out) >= trace_destination &&
+        GPUVAddr(regs.offset_out) < trace_destination + (32ULL << 20)) {
+        static u32 traced_destination{};
+        if (traced_destination++ < 40) {
+            LOG_INFO(HW_GPU,
+                     "nx2 DMA to traced dst: {:#x} -> {:#x} lines={} length={} pitch in={:#x} "
+                     "out={:#x} launch={:#x} src_layout={} dst_layout={}",
+                     static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out),
+                     regs.line_count, regs.line_length_in, regs.pitch_in, regs.pitch_out,
+                     regs.reg_array[0xc0], regs.launch_dma.src_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block",
+                     regs.launch_dma.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block");
         }
     }
-
-    // NS2 diagnostics: copies over the grid words of a known QMD (see ns2_qmd_watch.h).
-    const bool ns2_watch = memory_manager.UsesNativeTiling();
-    bool ns2_source_gpu_modified = false;
-    const u64 ns2_lines = regs.launch_dma.multi_line_enable ? std::max<u64>(regs.line_count, 1) : 1;
-    const u64 ns2_size = (ns2_lines - 1) * static_cast<u64>(std::abs(static_cast<s64>(regs.pitch_out))) +
-                         regs.line_length_in;
-    if (ns2_watch) {
-        if (const auto source = memory_manager.GpuToCpuAddress(regs.offset_in)) {
-            ns2_source_gpu_modified = rasterizer->MustFlushRegion(*source, regs.line_length_in);
+    if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
+        static u32 traced{};
+        if (traced++ < 64) {
+            LOG_INFO(HW_GPU, "nx2 DMA {:#x} -> {:#x} lines={} length={} launch={:#x}",
+                     static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out),
+                     regs.line_count, regs.line_length_in, regs.reg_array[0xc0]);
         }
     }
-    const auto ns2_note = [&] {
-        if (!ns2_watch) return;
-        VideoCommon::NS2QmdWatch::NoteWrite("copy engine", regs.offset_out, ns2_size, regs.offset_in,
-                                            ns2_source_gpu_modified, [&](u64 qmd) {
-            std::array<u32, 3> grid{};
-            memory_manager.ReadBlockUnsafe(qmd + 0x30, grid.data(), sizeof(grid));
-            return grid;
-        });
-    };
 
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
@@ -117,7 +102,6 @@ void MaxwellDMA::Launch() {
         if (!is_src_pitch && !is_dst_pitch) {
             // If both the source and the destination are in block layout, assert.
             CopyBlockLinearToBlockLinear();
-            ns2_note();
             ReleaseSemaphore();
             return;
         }
@@ -197,7 +181,6 @@ void MaxwellDMA::Launch() {
         }
     }
 
-    ns2_note();
     ReleaseSemaphore();
 }
 

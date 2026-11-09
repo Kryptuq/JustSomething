@@ -12,7 +12,6 @@
 #include <memory>
 #include <utility>
 
-#include "common/ns2_watch.h"
 #include "common/assert.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -141,7 +140,6 @@ struct GPU::Impl {
     }
 
     void WaitForSyncOperation(const u64 fence) {
-        Common::NS2Watch::PhaseScope phase{"waiting for GPU thread sync operation", nullptr, fence};
         std::unique_lock lck{sync_request_mutex};
         sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
     }
@@ -208,6 +206,14 @@ struct GPU::Impl {
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 
+    void RunInOrder(std::function<void()>&& func) {
+        gpu_thread.Run(std::move(func), is_async);
+    }
+
+    void MapInOrder(std::function<void()>&& func) {
+        gpu_thread.Run(std::move(func), is_async, true);
+    }
+
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size) {
         gpu_thread.FlushRegion(addr, size, is_async);
@@ -219,7 +225,16 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
-        const u64 fence = RequestSyncOperation([this, &raster_area]() {
+        // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
+        // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
+        if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
+            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
+                     raster_area.start_address, raster_area.end_address,
+                     reads.load(std::memory_order_relaxed));
+        }
+        const u64 fence = RequestSyncOperation([this, raster_area]() {
+            // Apply collected guest writes before downloading GPU data over guest memory.
+            InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
         gpu_thread.TickGPU(is_async);
@@ -275,17 +290,6 @@ struct GPU::Impl {
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                static std::atomic<u32> composite_fence_traces{};
-                const u32 trace_index = composite_fence_traces++;
-                if (trace_index < 48 || trace_index % 120 == 0) {
-                    for (size_t i = 0; i < num_fences; i++) {
-                        const u32 id = composite_fences[i].id;
-                        LOG_INFO(HW_GPU, "Composite #{} waits on fence: syncpoint={}, value={}, guest={}, host={}",
-                                 trace_index, id, composite_fences[i].value,
-                                 syncpoint_manager.GetGuestSyncpointValue(id),
-                                 syncpoint_manager.GetHostSyncpointValue(id));
-                    }
-                }
                 const auto executer = [this, current_request_counter, composite_layers]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
@@ -294,7 +298,6 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    Common::NS2Watch::g_composite_count.fetch_add(1, std::memory_order_relaxed);
                     renderer->Composite(composite_layers);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
@@ -421,6 +424,10 @@ u64 GPU::RequestFlush(DAddr addr, std::size_t size) {
     });
 }
 
+u64 GPU::RunOnGpuThread(std::function<void()>&& action) {
+    return impl->RequestSyncOperation(std::move(action));
+}
+
 u64 GPU::CurrentSyncRequestFence() const {
     return impl->CurrentSyncRequestFence();
 }
@@ -504,6 +511,10 @@ bool GPU::IsAsync() const {
     return impl->is_async;
 }
 
+bool GPU::HasSuspendedChannels() const {
+    return impl->scheduler.HasPendingChannelsAnyThread();
+}
+
 bool GPU::UseNvdec() const {
     return impl->use_nvdec;
 }
@@ -542,6 +553,14 @@ VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
 
 void GPU::FlushRegion(DAddr addr, u64 size) {
     impl->FlushRegion(addr, size);
+}
+
+void GPU::RunInOrder(std::function<void()>&& func) {
+    impl->RunInOrder(std::move(func));
+}
+
+void GPU::MapInOrder(std::function<void()>&& func) {
+    impl->MapInOrder(std::move(func));
 }
 
 void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {

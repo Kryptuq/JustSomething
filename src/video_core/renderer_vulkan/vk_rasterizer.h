@@ -7,7 +7,6 @@
 #pragma once
 
 #include <array>
-#include <memory>
 
 #include <boost/container/static_vector.hpp>
 
@@ -15,14 +14,12 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/ns2_draw_stats.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
-#include "video_core/renderer_vulkan/vk_ns2_gpu_timeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -102,6 +99,8 @@ public:
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out) override;
+    void NoteGpuWrittenCommandListSynced(DAddr page) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -126,15 +125,17 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void TickFrame() override;
-    void NoteNativeDraw();
-    void NativeDrawShaders(u64 (&shaders)[6]) const;
-    NS2GpuTimeline* NS2Timeline();
-    void TraceNativeDraw(VideoCommon::NS2Draw::Result result, bool is_indexed);
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                const Tegra::Engines::Fermi2D::Surface& dst,
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
+    bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
+                                   const Tegra::Engines::Fermi2D::Surface& dst,
+                                   const Tegra::Engines::Fermi2D::Surface& motion_vectors,
+                                   const Tegra::Texture::TICEntry* depth,
+                                   std::array<f32, 2> jitter,
+                                   std::array<f32, 2> motion_scale) override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -166,6 +167,10 @@ private:
     void PrepareDraw(bool is_indexed, Func&&);
 
     void FlushWork();
+
+    /// Records the copies of the command list pages the work just recorded wrote and submits, so
+    /// the GPU makes them now (BufferCache::Nx2CopyListPages).
+    void SubmitNx2ListCopies();
 
     void UpdateDynamicStates();
 
@@ -237,12 +242,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
-    u32 native_summary_frames = 0;
-    u32 native_trace_frames = 0;
-
-    // NS2 GPU timing diagnostics (created on the first native draw or dispatch).
-    std::unique_ptr<NS2GpuTimeline> ns2_timeline;
-    bool ns2_timeline_checked = false;
+    bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };
 
 } // namespace Vulkan

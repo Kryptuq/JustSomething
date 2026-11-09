@@ -4,17 +4,11 @@
 #include <array>
 #include <cstdlib>
 #include <atomic>
-#include <mutex>
-#include <thread>
-#include <condition_variable>
 #include <memory>
 #include <utility>
 
 #include "game_settings.h"
 #include "common/cpu_features.h"
-#include "common/ns2_watch.h"
-#include "common/thread.h"
-#include "common/fs/path_util.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
@@ -30,11 +24,15 @@
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
 #include "core/device_memory.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
+#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -68,7 +66,6 @@
 #include "core/reporter.h"
 #include "core/tools/freezer.h"
 #include "core/tools/renderdoc.h"
-#include "core/ns2_watchdog.h"
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
@@ -76,6 +73,8 @@
 #include "video_core/video_core.h"
 
 namespace Core {
+
+std::atomic<u64> g_nx2_present_count{};
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -115,6 +114,53 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
 }
+
+namespace {
+
+// Detect the platform before initializing the kernel memory layout and guest clock.
+bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
+    FileSys::ProgramMetadata metadata;
+    if (FileSys::NupContainer::IsNupFile(file)) {
+        FileSys::NupContainer nup{file};
+        if (nup.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        std::optional<std::size_t> program;
+        if (const auto base = nup.FindBasePackage();
+            base && nup.GetExeFSDir(*base) != nullptr) {
+            program = base;
+        } else if (const auto update = nup.FindBestUpdatePackage();
+                   update && nup.GetExeFSDir(*update) != nullptr) {
+            program = update;
+        }
+        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+               metadata.IsSwitch2();
+    }
+    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
+        const FileSys::NSP nsp{file, program_id, program_index};
+        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        auto exefs = nsp.GetExeFS();
+        if (!nsp.IsExtractedType()) {
+            const auto program =
+                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
+            exefs = program != nullptr ? program->GetExeFS() : nullptr;
+        }
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+               metadata.IsSwitch2();
+    }
+    const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
+    const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
+    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+           metadata.IsSwitch2();
+}
+
+} // namespace
 
 struct System::Impl {
     explicit Impl(System& system)
@@ -302,79 +348,41 @@ struct System::Impl {
     }
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
-        // NS2 diagnostics: a load that does not finish (the window stops responding) logs where
-        // the loading thread is, every 15 s. Another running instance of Eden is reported first:
-        // one that is still shutting down can hold files and memory.
-        if (const std::string others = Common::NS2Watch::OtherInstancesOfThisProgram(); !others.empty()) {
-            LOG_WARNING(Core, "NS2: other instances of this program are still running: {}", others);
-        }
-        struct LoadWatch {
-            std::mutex mutex;
-            std::condition_variable done_cv;
-            bool done = false;
-            std::thread thread;
-            ~LoadWatch() {
-                {
-                    std::scoped_lock lock{mutex};
-                    done = true;
-                }
-                done_cv.notify_all();
-                if (thread.joinable()) thread.join();
-            }
-        } load_watch;
-        load_watch.thread = std::thread([&load_watch, loader_thread = Common::NS2Watch::CurrentThreadId()] {
-            Common::SetCurrentThreadName("NS2LoadWatch");
-            std::unique_lock lock{load_watch.mutex};
-            for (u32 seconds = 15; !load_watch.done; seconds += 15) {
-                if (load_watch.done_cv.wait_for(lock, std::chrono::seconds{15}, [&] { return load_watch.done; })) break;
-                std::string phases;
-                for (const auto& phase : Common::NS2Watch::CollectPhases(0)) {
-                    phases += fmt::format(" [{}: {} {} for {} ms]", phase.thread, phase.label, phase.detail, phase.age_ms);
-                }
-                LOG_CRITICAL(Core, "NS2: loading has not finished after {} s; phases:{}; loading thread stack:{}",
-                             seconds, phases.empty() ? std::string{" none"} : phases,
-                             Common::NS2Watch::DescribeThreadStack(loader_thread));
-                if (const std::string others = Common::NS2Watch::OtherInstancesOfThisProgram(); !others.empty()) {
-                    LOG_CRITICAL(Core, "NS2: other instances of this program are running: {}", others);
-                }
-            }
-        });
-        Common::NS2Watch::PhaseScope load_phase{"loading", "start"};
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
 
-        // The Switch 2 counter runs at 31.25 MHz and its SDK converts ticks with that constant
-        // (the Yoshi demo's nn::os::GetSystemTickFrequency returns 31,250,000). At 19.2 MHz every
-        // tick-based time in the game was off by 1.63x: the game ran at ~37 instead of 60 FPS and
-        // its movies at 0.6x speed. EDEN_NX2_CNTFRQ=<Hz> overrides it. Ported from Eglantine.
-        {
-            static const u64 forced_cntfrq = [] {
-                const char* value = std::getenv("EDEN_NX2_CNTFRQ");
-                return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
-            }();
-            // params.program_id is often still 0 here (it is read from the loader later), so ask a
-            // temporary loader for it.
-            u64 early_program_id = params.program_id;
-            if (early_program_id == 0 && virtual_filesystem != nullptr) {
-                if (const auto game_file = GetGameFileFromPath(virtual_filesystem, filepath)) {
-                    if (const auto loader = Loader::GetLoader(system, game_file, params.program_id,
-                                                              params.program_index)) {
-                        loader->ReadProgramId(early_program_id);
-                    }
-                }
-            }
-            const bool switch2_program = (early_program_id >> 56) == 0x04;
-            const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq
-                               : switch2_program  ? Common::WallClock::Switch2CNTFRQ
-                                                  : Common::WallClock::CNTFRQ;
-            Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
-            LOG_INFO(Core, "Guest counter frequency: {} Hz (program {:016X})", cntfrq, early_program_id);
+        const bool switch2_program =
+            virtual_filesystem != nullptr &&
+            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
+                             params.program_index);
+        Settings::SetCurrentProgramIsSwitch2(switch2_program);
+        Settings::SetAstcRecompressionOverride(std::nullopt);
+
+        // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
+        // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
+        if (switch2_program &&
+            Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
+            LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
+            Settings::values.memory_layout_mode.SetGlobal(false);
+            Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
         }
 
-        Common::NS2Watch::SetPhase("loading", "kernel initialization");
+        // The Switch 2 counter runs at 31.25 MHz and its SDK converts ticks with that constant
+        // (nn::os::GetSystemTickFrequency, TickManager::ConvertToTimeSpan/ConvertToTick). At 19.2 MHz
+        // every tick-based time in the game was off by 1.63x: elapsed times read short and a frame
+        // deadline in ticks waited ~27 ms. EDEN_NX2_CNTFRQ=<Hz> overrides it (A/B tests).
+        static const u64 forced_cntfrq = [] {
+            const char* value = std::getenv("EDEN_NX2_CNTFRQ");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq
+                           : switch2_program  ? Common::WallClock::Switch2CNTFRQ
+                                              : Common::WallClock::CNTFRQ;
+        Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
+        LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
+
         InitializeKernel(system);
-        Common::NS2Watch::SetPhase("loading", "application process");
 
         if (params.applet_type == Service::AM::AppletType::Application) {
             current_application_filepath = filepath;
@@ -400,12 +408,6 @@ struct System::Impl {
         if (app_loader->ReadProgramId(params.program_id) != Loader::ResultStatus::Success) {
             LOG_ERROR(Core, "Failed to find program id for ROM!");
         }
-        // Fallback if the early program id lookup above failed: counter reads still follow.
-        if ((params.program_id >> 56) == 0x04 && std::getenv("EDEN_NX2_CNTFRQ") == nullptr &&
-            Common::g_wall_clock.GetGuestCNTFRQ() != Common::WallClock::Switch2CNTFRQ) {
-            Common::g_wall_clock.SetGuestCNTFRQ(Common::WallClock::Switch2CNTFRQ);
-            LOG_WARNING(Core, "Guest counter frequency corrected to {} Hz after loading", Common::WallClock::Switch2CNTFRQ);
-        }
 
         std::string name = "Unknown program";
         if (app_loader->ReadTitle(name) != Loader::ResultStatus::Success) {
@@ -424,7 +426,6 @@ struct System::Impl {
         kernel.SetApplicationProcess(process->GetHandle());
 
         // Set up the rest of the system.
-        Common::NS2Watch::SetPhase("loading", "GPU, audio and services");
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
@@ -432,9 +433,7 @@ struct System::Impl {
             return init_result;
         }
         // Waiting for GPU before initializing CPU
-        Common::NS2Watch::SetPhase("loading", "CPU cores");
         cpu_manager.Initialize();
-        Common::NS2Watch::SetPhase("loading", "applet manager");
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -455,12 +454,6 @@ struct System::Impl {
         }
 
         perf_stats.emplace(params.program_id);
-        // Switch 2 titles: report guest/host thread state if the game stops presenting frames.
-        if ((params.program_id >> 56) == 0x04) {
-            ns2_watchdog = std::make_unique<NS2Watchdog>(system);
-            Common::NS2Watch::InstallCrashReport(
-                (Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_crash.txt").string());
-        }
         // Reset counters and set time origin to current frame
         GetAndResetPerfStats();
         perf_stats->BeginSystemFrame();
@@ -485,7 +478,6 @@ struct System::Impl {
     }
 
     void ShutdownMainProcess() {
-        ns2_watchdog.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 
@@ -544,6 +536,9 @@ struct System::Impl {
     }
 
     PerfStatsResults GetAndResetPerfStats() {
+        if (!perf_stats) {
+            return {};
+        }
         return perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
     }
 
@@ -575,7 +570,6 @@ struct System::Impl {
     std::optional<Service::KernelHelpers::ServiceContext> general_channel_context;
     std::optional<Service::Event> general_channel_event;
     std::optional<Core::PerfStats> perf_stats;
-    std::unique_ptr<NS2Watchdog> ns2_watchdog;
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
     std::optional<AudioCore::AudioCore> audio_core;
@@ -1105,6 +1099,8 @@ void System::ApplySettings() {
 
     if (IsPoweredOn()) {
         Renderer().RefreshBaseSettings();
+        // Frontends switch docked/handheld through the settings; let the running game know.
+        GetAppletManager().OperationModeChanged();
     }
 }
 

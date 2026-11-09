@@ -77,14 +77,8 @@ public:
     virtual Result HandleSyncRequest(Kernel::KServerSession& session,
                                      HLERequestContext& context) = 0;
 
-    /// Name used in diagnostics (the service name passed at construction).
-    const char* GetDebugName() const noexcept {
-        return debug_name ? debug_name : "unnamed";
-    }
-
 protected:
     Kernel::KernelCore& kernel;
-    const char* debug_name{};
 };
 
 using SessionRequestHandlerWeakPtr = std::weak_ptr<SessionRequestHandler>;

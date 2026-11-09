@@ -109,7 +109,7 @@ int main(int argc, char* argv[]) {
 
     // Init settings params
     QCoreApplication::setOrganizationName(QStringLiteral("eden"));
-    QCoreApplication::setApplicationName(QStringLiteral("eden"));
+    QCoreApplication::setApplicationName(QStringLiteral("Eglantine"));
 
     // Increases the maximum open file limit.
     // TODO: This should be common to all frontends.
@@ -122,11 +122,11 @@ int main(int argc, char* argv[]) {
     _setmaxstdio(8192);
 #endif // __MSVCRT__
 #elif defined(__unix__) || defined(__APPLE__)
-    // Set the max open file limit to 8192, or the hard limit.
+    // Raise the open file limit to at least 8192, or the hard limit.
     // Most sane systems should not hit the hard limit here.
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        rl.rlim_cur = std::min<rlim_t>(8192, rl.rlim_max);
+        rl.rlim_cur = std::min<rlim_t>(1048576, rl.rlim_max);
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 #endif // _WIN32
@@ -161,7 +161,7 @@ int main(int argc, char* argv[]) {
 
     // Fix the Wayland appId. This needs to match the name of the .desktop file without the .desktop
     // suffix.
-    QGuiApplication::setDesktopFileName(QStringLiteral("dev.eden_emu.eden"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("dev.eglantine.eglantine"));
 #endif
 
     auto rounding_policy = GetHighDpiRoundingPolicy();

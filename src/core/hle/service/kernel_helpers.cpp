@@ -4,9 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <unordered_map>
-#include <string>
 #include <mutex>
+#include <unordered_map>
+
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -20,21 +20,10 @@
 namespace Service::KernelHelpers {
 
 namespace {
+// Event names for the debugger's handle listing.
 std::mutex event_names_mutex;
 std::unordered_map<const Kernel::KEvent*, std::string> event_names;
 } // namespace
-
-void NameEventForDebugging(const Kernel::KEvent* event, std::string_view name) {
-    std::scoped_lock lock{event_names_mutex};
-    if (name.empty()) event_names.erase(event);
-    else event_names[event] = std::string{name};
-}
-
-std::string EventNameForDebugging(const Kernel::KEvent* event) {
-    std::scoped_lock lock{event_names_mutex};
-    const auto it = event_names.find(event);
-    return it == event_names.end() ? std::string{"<guest or unnamed>"} : it->second;
-}
 
 ServiceContext::ServiceContext(Core::System& system_, std::string name_)
     : kernel(system_.Kernel())
@@ -57,6 +46,17 @@ ServiceContext::~ServiceContext() {
         process->Close(kernel);
         process = nullptr;
     }
+}
+
+namespace {
+std::mutex debug_names_mutex;
+std::unordered_map<const Kernel::KReadableEvent*, std::string> debug_names;
+} // Anonymous namespace
+
+std::string DebugEventName(const Kernel::KReadableEvent* event) {
+    std::scoped_lock lk{debug_names_mutex};
+    const auto it = debug_names.find(event);
+    return it != debug_names.end() ? it->second : std::string{"?"};
 }
 
 Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
@@ -83,17 +83,37 @@ Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
 
     // Register the event.
     Kernel::KEvent::Register(kernel, event);
-    NameEventForDebugging(event, name);
 
+    {
+        std::scoped_lock lk{debug_names_mutex};
+        debug_names[&event->GetReadableEvent()] = name;
+    }
+    {
+        std::scoped_lock lk{event_names_mutex};
+        event_names[event] = std::move(name);
+    }
     return event;
 }
 
 void ServiceContext::CloseEvent(Kernel::KEvent* event) {
     if (event) {
-        NameEventForDebugging(event, {});
+        {
+            std::scoped_lock lk{event_names_mutex};
+            event_names.erase(event);
+        }
+        {
+            std::scoped_lock lk{debug_names_mutex};
+            debug_names.erase(&event->GetReadableEvent());
+        }
         event->GetReadableEvent().Close(kernel);
         event->Close(kernel);
     }
+}
+
+std::string ServiceContext::GetEventName(const Kernel::KEvent* event) {
+    std::scoped_lock lk{event_names_mutex};
+    const auto it = event_names.find(event);
+    return it == event_names.end() ? std::string{} : it->second;
 }
 
 } // namespace Service::KernelHelpers

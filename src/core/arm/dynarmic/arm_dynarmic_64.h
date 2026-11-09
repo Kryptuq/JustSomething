@@ -57,7 +57,6 @@ public:
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
-    void NoteWriterTrace(u64 vaddr, u64 size, u64 value, u64 value_high);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
     Dynarmic::CodePage cached_code_page;
@@ -66,6 +65,8 @@ public:
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};
     u64 m_tpidr_el0{};
+    u64 m_last_cntpct{}; ///< The previous counter read (GetCNTPCT spin detection)
+    u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
     Kernel::KProcess* m_process{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};

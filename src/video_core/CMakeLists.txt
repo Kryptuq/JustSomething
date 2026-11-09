@@ -75,8 +75,6 @@ add_library(video_core STATIC
     host1x/codec_types.h
     host1x/ffmpeg.cpp
     host1x/ffmpeg.h
-    host1x/ns2_video_decoder.cpp
-    host1x/ns2_video_decoder.h
     host1x/control.cpp
     host1x/control.h
     host1x/gpu_device_memory_manager.cpp
@@ -86,24 +84,31 @@ add_library(video_core STATIC
     host1x/nvdec.cpp
     host1x/nvdec.h
     host1x/nvdec_common.h
+    host1x/nx2_video_decoder.cpp
+    host1x/nx2_video_decoder.h
     host1x/syncpoint_manager.cpp
     host1x/syncpoint_manager.h
     host1x/vic.cpp
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_memo.h
+    macro_turing.h
     fence_manager.h
     gpu.cpp
     gpu.h
-    native_query_trace.h
-    native_semaphore.h
-    native_strict.h
+    gpu_split.cpp
+    gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    native_qmd.h
+    native_query_trace.h
+    nx2.h
+    nx2_profile.h
     present.h
     pte_kind.h
     query_cache/bank_base.h
@@ -129,6 +134,8 @@ add_library(video_core STATIC
     renderer_vulkan/present/filters.h
     renderer_vulkan/present/fsr.cpp
     renderer_vulkan/present/fsr.h
+    renderer_vulkan/present/fsr3.cpp
+    renderer_vulkan/present/fsr3.h
     renderer_vulkan/present/fxaa.cpp
     renderer_vulkan/present/fxaa.h
     renderer_vulkan/present/layer.cpp
@@ -162,6 +169,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
     renderer_vulkan/vk_compute_pass.h
+    renderer_vulkan/vk_fsr3_upscaler.cpp
+    renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_descriptor_buffer.cpp
@@ -176,8 +185,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
     renderer_vulkan/vk_master_semaphore.h
-    renderer_vulkan/vk_ns2_gpu_timeline.cpp
-    renderer_vulkan/vk_ns2_gpu_timeline.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_present_manager.cpp
@@ -230,6 +237,7 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
     smaa_area_tex.h
@@ -249,16 +257,9 @@ add_library(video_core STATIC
     texture_cache/image_base.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
-    texture_cache/pending_download.h
     texture_cache/image_view_base.cpp
     texture_cache/image_view_base.h
     texture_cache/image_view_info.cpp
-    ns2_draw_stats.cpp
-    ns2_draw_stats.h
-    ns2_command_trace.cpp
-    ns2_command_trace.h
-    ns2_qmd_watch.cpp
-    ns2_qmd_watch.h
     texture_cache/image_view_info.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
@@ -292,6 +293,8 @@ if (ENABLE_LSFG)
         frame_gen/lsfg_translate.h
         renderer_vulkan/present/frame_gen.cpp
         renderer_vulkan/present/frame_gen.h
+        renderer_vulkan/present/fsr3_frame_gen.cpp
+        renderer_vulkan/present/fsr3_frame_gen.h
         renderer_vulkan/present/frame_gen_pacer.cpp
         renderer_vulkan/present/frame_gen_pacer.h
         renderer_vulkan/present/lsfg_alpha.cpp
@@ -494,6 +497,33 @@ endif()
 
 if (ANDROID AND ARCHITECTURE_arm64)
     target_link_libraries(video_core PRIVATE adrenotools)
+endif()
+
+# NVIDIA DLSS through NVIDIA Streamline, in place of a game's DLSS (before FSR 3.1) when the
+# setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
+# linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
+cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
+                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
+    "NVIDIA Streamline SDK directory for its headers (empty: download them)")
+if (ENABLE_NVIDIA_DLSS)
+    if (EGLANTINE_STREAMLINE_SDK)
+        set(STREAMLINE_INCLUDE_DIR "${EGLANTINE_STREAMLINE_SDK}/include")
+    else()
+        AddJsonPackage(NAME streamline DOWNLOAD_ONLY)
+        set(STREAMLINE_INCLUDE_DIR "${streamline_SOURCE_DIR}/include")
+    endif()
+    target_sources(video_core PRIVATE
+        renderer_vulkan/vk_streamline_dlss.cpp
+        renderer_vulkan/vk_streamline_dlss.h
+        vulkan_common/streamline.cpp
+        vulkan_common/streamline.h
+        vulkan_common/streamline_api.h
+    )
+    target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
+    target_link_libraries(video_core PRIVATE version wintrust crypt32)
+    target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
+    message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
 
 create_target_directory_groups(video_core)

@@ -11,6 +11,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -19,12 +20,10 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
-#include "video_core/ns2_order_trace.h"
-#include "video_core/host1x/host1x.h"
-#include <string_view>
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
-#include "video_core/native_query_trace.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -34,20 +33,93 @@ namespace {
 constexpr u32 Gf100BindClassMask = 0xffff;
 constexpr u32 Gf100BindValidMask =  0x1f0000 | Gf100BindClassMask;
 
-u32 ReadNativeSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
-    const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
-    if (cpu_address && dma_pusher.rasterizer->MustFlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
-        dma_pusher.rasterizer->FlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache);
-        const u32 value = dma_pusher.memory_manager.Read<u32>(address);
-        LOG_WARNING(HW_GPU, "Native semaphore buffer readback: address={:#x}, current={}", address, value);
-        VideoCommon::TraceNativeQuery(6, dma_pusher.memory_manager.GetID(), address, *cpu_address, 0, value, 0);
-        return value;
+// Reads a semaphore word, flushing a GPU-written copy out of the buffer cache first.
+u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+        device && dma_pusher.rasterizer->MustFlushRegion(*device, sizeof(u32),
+                                                          VideoCommon::CacheType::BufferCache)) {
+        dma_pusher.rasterizer->FlushRegion(*device, sizeof(u32),
+                                           VideoCommon::CacheType::BufferCache);
     }
     return dma_pusher.memory_manager.Read<u32>(address);
 }
 
+// With the GPU thread split (gpu_split.h) the rasterizer belongs to the back thread: work that
+// only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack).
+template <typename Func>
+void OnBack(const Func& func) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.Defer(func);
+    } else {
+        func();
+    }
+}
+
+void DrainBack() {
+    VideoCommon::GpuSplit::Get().Drain();
+}
 
 } // Anonymous namespace
+
+bool Puller::PendingAcquire::Matches(u32 current) const {
+    switch (static_cast<GpuSemaphoreOperation>(operation)) {
+    case GpuSemaphoreOperation::AcquireEqual:
+        return current == value;
+    case GpuSemaphoreOperation::AcquireGequal:
+        return current >= value;
+    case GpuSemaphoreOperation::AcquireMask:
+        return (current & value) != 0;
+    default:
+        return true;
+    }
+}
+
+bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+    if (!pending_acquire) {
+        return true;
+    }
+    // The release may still be queued for the split GPU thread's back half (and the caches
+    // ReadSemaphoreWord asks are its state).
+    DrainBack();
+    const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+        if (static std::atomic<u32> rescued{};
+            !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
+            LOG_INFO(HW_GPU, "Channel {} met semaphore {:#x} value {:#x} at its release (now {:#x})",
+                     dma_pusher.channel_state.bind_id, pending_acquire->address,
+                     pending_acquire->value, current);
+        }
+        return true;
+    }
+    if (pending_acquire->Matches(current)) {
+        return true;
+    }
+    if (!pending_acquire->reported &&
+        std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
+        pending_acquire->reported = true;
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+        LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s; "
+                    "device {:#x}, buffer cache holds GPU data: {}, words {:08x} {:08x} {:08x} {:08x}",
+                    dma_pusher.channel_state.bind_id, pending_acquire->address,
+                    pending_acquire->operation, pending_acquire->value, current, device.value_or(0),
+                    device && dma_pusher.rasterizer->MustFlushRegion(*device, 16, VideoCommon::CacheType::All),
+                    dma_pusher.memory_manager.Read<u32>(pending_acquire->address & ~GPUVAddr{0xf}),
+                    dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),
+                    dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
+                    dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
+    }
+    return false;
+}
+
+bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
+    if (!CanResumeAcquire(dma_pusher)) {
+        return false;
+    }
+    pending_acquire.reset();
+    dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+    Nx2SemaphoreWaiters::Get().Remove(this);
+    return true;
+}
 
 void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
     LOG_DEBUG(HW_GPU, "Binding subchannel {} to engine {:#x}", method_call.subchannel, method_call.argument);
@@ -55,40 +127,40 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
     if ((engine & ~Gf100BindClassMask) != 0 && (engine & ~Gf100BindValidMask) == 0) {
         engine &= Gf100BindClassMask;
     }
+    // Switch 2 binds Ampere classes; run them on the Maxwell engines (same method layout for
+    // most state). Class 0 unbinds the subchannel.
+    switch (engine & 0xFFFF) {
+    case 0xC797: // AMPERE_B
+        engine = static_cast<u32>(EngineID::MAXWELL_B);
+        break;
+    case 0xC7C0: // AMPERE_COMPUTE_B
+        engine = static_cast<u32>(EngineID::KEPLER_COMPUTE_B);
+        break;
+    case 0xC7B5: // AMPERE_DMA_COPY_B
+        engine = static_cast<u32>(EngineID::MAXWELL_DMA_COPY_A);
+        break;
+    case 0x0:
+        if (g_nx2_ampere) {
+            LOG_DEBUG(HW_GPU, "Switch 2 unbinds subchannel {}", method_call.subchannel);
+            return;
+        }
+        break;
+    default:
+        break;
+    }
 
-    if (dma_pusher.channel_state.native_abi) dma_pusher.memory_manager.EnableNativeTiling();
     const auto engine_id = static_cast<EngineID>(engine);
     bound_engines[method_call.subchannel] = engine_id;
     switch (engine_id) {
     case EngineID::FERMI_TWOD_A:
         dma_pusher.BindSubchannel(&dma_pusher.channel_state.payload->fermi_2d, method_call.subchannel, EngineTypes::Fermi2D);
         break;
-    case EngineID::AMPERE_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        dma_pusher.channel_state.payload->maxwell_3d.SetNativeTuringMacroMode(true);
-        dma_pusher.BindSubchannel(&dma_pusher.channel_state.payload->maxwell_3d, method_call.subchannel, EngineTypes::Maxwell3D);
-        break;
     case EngineID::MAXWELL_B:
-        dma_pusher.channel_state.payload->maxwell_3d.SetNativeTuringMacroMode(false);
         dma_pusher.BindSubchannel(&dma_pusher.channel_state.payload->maxwell_3d, method_call.subchannel, EngineTypes::Maxwell3D);
         break;
-    case EngineID::AMPERE_COMPUTE_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        [[fallthrough]];
     case EngineID::KEPLER_COMPUTE_B:
-        if (engine_id == EngineID::AMPERE_COMPUTE_B && dma_pusher.channel_state.native_macro_context) {
-            auto& context = *dma_pusher.channel_state.native_macro_context;
-            dma_pusher.channel_state.payload->kepler_compute.SetNativeMacroMode(&context.engine, context.positions, &context);
-        } else {
-            dma_pusher.channel_state.payload->kepler_compute.SetNativeMacroMode(
-                engine_id == EngineID::AMPERE_COMPUTE_B ? &dma_pusher.channel_state.payload->maxwell_3d.GetNativeMacroEngine() : nullptr,
-                dma_pusher.channel_state.payload->maxwell_3d.GetNativeMacroPositions());
-        }
         dma_pusher.BindSubchannel(&dma_pusher.channel_state.payload->kepler_compute, method_call.subchannel, EngineTypes::KeplerCompute);
         break;
-    case EngineID::AMPERE_DMA_COPY_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        [[fallthrough]];
     case EngineID::MAXWELL_DMA_COPY_A:
         dma_pusher.BindSubchannel(&dma_pusher.channel_state.payload->maxwell_dma, method_call.subchannel, EngineTypes::MaxwellDMA);
         break;
@@ -106,49 +178,15 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
 
 void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     switch (regs.fence_action.op) {
-    case Puller::FenceOperation::Acquire: {
-        dma_pusher.rasterizer->ReleaseFences();
-        if (!dma_pusher.channel_state.native_abi || SyncpointWaitDisabled()) break;
-        const u32 id = regs.fence_action.syncpoint_id;
-        const u32 value = regs.fence_value;
-        if (SyncpointReached(dma_pusher, id, value)) break;
-        dma_pusher.rasterizer->ReleaseFences(true);
-        if (SyncpointReached(dma_pusher, id, value)) break;
-        // Another channel (or engine) has not produced the awaited work yet. On hardware this
-        // channel stalls here; executing on would read results before they are written (for
-        // example a video frame copy that is submitted after the draw that samples it).
-        native_syncpoint_wait = NativeSyncpointWait{id, value, std::chrono::steady_clock::now()};
-        static u32 wait_traces{};
-        if (wait_traces < 32 || wait_traces % 1000 == 0) {
-            auto& manager = dma_pusher.system.Host1x().GetSyncpointManager();
-            LOG_INFO(HW_GPU, "Native channel {} waits for syncpoint {} >= {} (guest {}, host {}) #{}",
-                     dma_pusher.channel_state.bind_id, id, value, manager.GetGuestSyncpointValue(id),
-                     manager.GetHostSyncpointValue(id), wait_traces);
-        }
-        ++wait_traces;
+    case Puller::FenceOperation::Acquire:
+        // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
+        // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         break;
-    }
     case Puller::FenceOperation::Increment:
-        if (dma_pusher.channel_state.native_abi) {
-            const auto& context = dma_pusher.channel_state.native_macro_context;
-            if (context && (context->engine.native_execution_failed || context->compute_engine.native_execution_failed)) {
-                LOG_ERROR(HW_GPU, "Native submission completion blocked by failed GPU work: syncpoint={}", regs.fence_action.syncpoint_id.Value());
-                break;
-            }
-        }
-        if (dma_pusher.channel_state.native_abi) {
-            static u32 native_increment_traces{};
-            const u32 trace_index = native_increment_traces++;
-            if (trace_index < 64 || trace_index % 256 == 0) {
-                LOG_INFO(HW_GPU, "Native syncpoint increment #{}: channel={}, syncpoint={}",
-                         trace_index, dma_pusher.channel_state.bind_id, regs.fence_action.syncpoint_id.Value());
-            }
-        }
-        if (dma_pusher.channel_state.native_abi && dma_pusher.channel_state.bind_id != 1 && VideoCommon::NS2Order::Take()) {
-            LOG_INFO(HW_GPU, "NS2 order: syncpoint ch={} id={} +1", dma_pusher.channel_state.bind_id,
-                     regs.fence_action.syncpoint_id.Value());
-        }
-        dma_pusher.rasterizer->SignalSyncPoint(regs.fence_action.syncpoint_id);
+        OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
+            rasterizer->SignalSyncPoint(id);
+        });
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
@@ -156,110 +194,96 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     }
 }
 
-bool Puller::SyncpointWaitDisabled() {
-    static const bool disabled = [] {
-        const char* value = std::getenv("EDEN_NATIVE_SYNCPOINT_WAIT");
-        return value && std::string_view{value} == "0";
-    }();
-    return disabled;
-}
-
-bool Puller::SyncpointReached(DmaPusher& dma_pusher, u32 id, u32 value) {
-    auto& manager = dma_pusher.system.Host1x().GetSyncpointManager();
-    const auto reached = [value](u32 current) { return static_cast<s32>(current - value) >= 0; };
-    return reached(manager.GetGuestSyncpointValue(id)) || reached(manager.GetHostSyncpointValue(id));
-}
-
-bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
-    if (native_syncpoint_wait) {
-        if (dma_pusher.memory_manager.IsShuttingDown()) return true;
-        if (SyncpointReached(dma_pusher, native_syncpoint_wait->id, native_syncpoint_wait->value)) return true;
-        // Safety net against waits nothing in the emulator will ever satisfy.
-        return std::chrono::steady_clock::now() - native_syncpoint_wait->since > std::chrono::milliseconds{250};
-    }
-    return native_acquire && !dma_pusher.memory_manager.IsShuttingDown() &&
-           native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address));
-}
-
-bool Puller::ResumeNativeAcquire(DmaPusher& dma_pusher) {
-    if (native_syncpoint_wait) {
-        if (!CanResumeNativeAcquire(dma_pusher)) return false;
-        if (!SyncpointReached(dma_pusher, native_syncpoint_wait->id, native_syncpoint_wait->value)) {
-            static u32 timeout_traces{};
-            if (timeout_traces++ < 32) {
-                LOG_WARNING(HW_GPU, "Native channel {} syncpoint wait {} >= {} timed out; continuing",
-                            dma_pusher.channel_state.bind_id, native_syncpoint_wait->id,
-                            native_syncpoint_wait->value);
-            }
-        }
-        native_syncpoint_wait.reset();
-        return true;
-    }
-    if (!native_acquire) return true;
-    if (!CanResumeNativeAcquire(dma_pusher)) return false;
-    LOG_WARNING(HW_GPU, "Native channel resumed after semaphore: channel={}, address={:#x}, current={}, required={}",
-                dma_pusher.channel_state.bind_id, native_acquire->address,
-                dma_pusher.memory_manager.Read<u32>(native_acquire->address), native_acquire->value);
-    VideoCommon::TraceNativeQuery(5, dma_pusher.memory_manager.GetID(), native_acquire->address,
-        dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address).value_or(0),
-        0, native_acquire->value, native_acquire->operation);
-    native_acquire.reset();
-    return true;
-}
-
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
+    // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
+    static const GPUVAddr watch = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+        return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
+    }();
+    if (watch != 0 && (regs.semaphore_address.SemaphoreAddress() & ~GPUVAddr{0xf}) == watch) {
+        LOG_INFO(HW_GPU, "Semaphore watch: channel {} as {} device {:#x} op {} {:#x} value {:#x} (now {:#x})",
+                 dma_pusher.channel_state.bind_id, dma_pusher.memory_manager.GetID(),
+                 dma_pusher.memory_manager.GpuToCpuAddress(regs.semaphore_address.SemaphoreAddress()).value_or(0),
+                 static_cast<u32>(op),
+                 regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence,
+                 dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress()));
+    }
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
-        if (dma_pusher.channel_state.native_abi && dma_pusher.channel_state.bind_id != 1 && VideoCommon::NS2Order::Take()) {
-            LOG_INFO(HW_GPU, "NS2 order: release ch={} {:#x} = {}", dma_pusher.channel_state.bind_id,
-                     sequence_address, payload);
-        }
-        const auto properties = dma_pusher.channel_state.native_abi && (regs.semaphore_trigger & (1U << 24))
-            ? VideoCommon::QueryPropertiesFlags::IsAFence : VideoCommon::QueryPropertiesFlags::HasTimeout;
-        dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-    } else {
-        do {
-            u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
-            if (dma_pusher.channel_state.native_abi) {
-                word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
-                const auto ready = [&] {
-                    if (op == GpuSemaphoreOperation::AcquireEqual) return word == regs.semaphore_sequence;
-                    if (op == GpuSemaphoreOperation::AcquireGequal) return word >= regs.semaphore_sequence;
-                    if (op == GpuSemaphoreOperation::AcquireMask) return (word & regs.semaphore_sequence) != 0;
-                    return false;
-                };
-                if (dma_pusher.channel_state.bind_id != 1 && VideoCommon::NS2Order::Take()) {
-                    LOG_INFO(HW_GPU, "NS2 order: acquire ch={} {:#x} op={} need={} have={} ready={}",
-                             dma_pusher.channel_state.bind_id, regs.semaphore_address.SemaphoreAddress(),
-                             static_cast<u32>(op), regs.semaphore_sequence, word, ready());
-                }
-                if (!ready()) {
-                    dma_pusher.rasterizer->ReleaseFences(true);
-                    word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
-                    static u32 native_wait_traces{};
-                    if (ready() && native_wait_traces++ < 8) {
-                        LOG_WARNING(HW_GPU, "Native semaphore completed after pending GPU fences: address={:#x}, current={}, required={}",
-                                    regs.semaphore_address.SemaphoreAddress(), word, regs.semaphore_sequence);
-                    }
-                }
-                if (!ready()) {
-                    if (!NativeSemaphoreWait::Supported(static_cast<u32>(op))) {
-                        if (auto context = dma_pusher.channel_state.native_macro_context) context->engine.native_execution_failed = true;
-                        LOG_ERROR(HW_GPU, "Unsupported native semaphore operation {}", static_cast<u32>(op));
-                    } else {
-                        native_acquire = NativeSemaphoreWait{regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence, static_cast<u32>(op)};
-                        VideoCommon::TraceNativeQuery(4, dma_pusher.memory_manager.GetID(), native_acquire->address,
-                            dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address).value_or(0),
-                            0, native_acquire->value, native_acquire->operation);
-                        LOG_WARNING(HW_GPU, "Native channel suspended for semaphore: channel={}, address={:#x}, current={}, required={}",
-                                    dma_pusher.channel_state.bind_id, native_acquire->address, word, native_acquire->value);
-                    }
-                }
-                break;
+        // RELEASE_SIZE (bit 24) set means a 4-byte release without the timestamp; writing 16
+        // bytes there clobbers the words next to it (Switch 2 packs semaphores tightly).
+        const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
+                                    ? VideoCommon::QueryPropertiesFlags::IsAFence
+                                    : VideoCommon::QueryPropertiesFlags::HasTimeout;
+        // NVN's two-page queue semaphore regions hold two different counters: the first page the
+        // fence counter its 3D report-semaphore releases write (nvnSyncWait polls it, GPU waits
+        // acquire it), the second page the GPFIFO position its host releases write after each
+        // segment. Nothing copies one into the other; copying the GPFIFO position over the fence
+        // counter made every pending fence look reached (Yoshi reused constant memory the GPU
+        // still had to read: the title movie's flicker). EDEN_NX2_SEMAPHORE_MIRROR=1 restores the
+        // copy for comparisons.
+        static const bool mirror_releases = [] {
+            const char* value = std::getenv("EDEN_NX2_SEMAPHORE_MIRROR");
+            const bool enabled = value != nullptr && value[0] == '1';
+            if (enabled) {
+                LOG_INFO(HW_GPU, "EDEN_NX2_SEMAPHORE_MIRROR=1: mirroring second-page semaphore "
+                                 "releases into the first page (old behaviour)");
             }
+            return enabled;
+        }();
+        const GPUVAddr mirror =
+            g_nx2_ampere && mirror_releases ? Nx2SemaphoreMirror(sequence_address) : 0;
+        if (mirror != 0) {
+            LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
+        }
+        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
+            rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
+            if (mirror != 0) {
+                rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
+            }
+        });
+    } else if (g_nx2_ampere) {
+        // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
+        // written the commands this channel runs next: suspend the channel until the value is
+        // met instead of reading ahead (approach from changes.patch).
+        PendingAcquire acquire{
+            .address = regs.semaphore_address.SemaphoreAddress(),
+            .value = regs.semaphore_sequence,
+            .operation = static_cast<u32>(op),
+            .since = std::chrono::steady_clock::now(),
+            .reported = false,
+        };
+        if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
+            op != GpuSemaphoreOperation::AcquireMask) {
+            LOG_ERROR(HW_GPU, "Invalid semaphore operation {}", static_cast<u32>(op));
+            return;
+        }
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        DrainBack();
+        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            return;
+        }
+        // Registered before the fences run, so a release among them that meets the value counts
+        // even if a later one overwrites it.
+        auto& waiters = Nx2SemaphoreWaiters::Get();
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+            waiters.Add(this, *device, acquire.value, acquire.operation);
+        }
+        dma_pusher.rasterizer->ReleaseFences();
+        if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            pending_acquire = acquire;
+            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+        } else {
+            waiters.Remove(this);
+        }
+    } else {
+        DrainBack();
+        do {
+            const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             regs.acquire_source = true;
             regs.acquire_value = regs.semaphore_sequence;
             if (op == GpuSemaphoreOperation::AcquireEqual) {
@@ -291,14 +315,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
-    if (dma_pusher.channel_state.native_abi && VideoCommon::NS2Order::Take()) {
-        LOG_INFO(HW_GPU, "NS2 order: release(legacy) ch={} {:#x} = {}", dma_pusher.channel_state.bind_id,
-                 sequence_address, payload);
-    }
-    dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+    OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
+        rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
+                          VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+    });
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+    DrainBack();
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {
@@ -312,8 +336,46 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
     }
 }
 
+// Ampere SEM_EXECUTE (method 0x1B): operation in bits 2:0 on the semaphore at
+// SEM_ADDR_HI:SEM_ADDR_LO (methods 0x18/0x17) with payload SEM_PAYLOAD_LO (0x19).
+void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+    const GPUVAddr address = (GPUVAddr{regs.reg_array[0x18] & 0x1FFFFFF} << 32) |
+                             (regs.reg_array[0x17] & ~3U);
+    const u32 payload = regs.reg_array[0x19];
+    const u32 operation = argument & 7;
+    if (operation == 1) { // RELEASE
+        OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
+            rasterizer->Query(address, VideoCommon::QueryType::Payload,
+                              VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+        });
+        return;
+    }
+    // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    DrainBack();
+    dma_pusher.rasterizer->ReleaseFences();
+    const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+    const bool ready = operation == 0   ? word == payload
+                       : operation == 2 ? word >= payload
+                       : operation == 3 ? static_cast<s32>(word - payload) >= 0
+                       : operation == 4 ? (word & payload) != 0
+                       : operation == 5 ? (word & payload) == 0
+                                        : true;
+    if (!ready) {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 8) {
+            LOG_WARNING(HW_GPU, "SEM_EXECUTE op {} at {:#x}: {:#x} vs {:#x} not met, continuing",
+                        operation, address, word, payload);
+        }
+    }
+}
+
 /// Calls a GPU puller method.
 void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
+    static const bool nx2_trace = std::getenv("EDEN_NX2_PULLER_TRACE") != nullptr;
+    if (nx2_trace) {
+        LOG_INFO(HW_GPU, "nx2 puller sub={} method={:#x} arg={:#x}", method_call.subchannel,
+                 method_call.method, method_call.argument);
+    }
     regs.reg_array[method_call.method] = method_call.argument;
     const auto method = static_cast<BufferMethods>(method_call.method);
 
@@ -330,13 +392,13 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WrcacheFlush:
         break;
     case BufferMethods::RefCnt:
-        dma_pusher.rasterizer->SignalReference();
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); });
         break;
     case BufferMethods::SyncpointOperation:
         ProcessFenceActionMethod(dma_pusher);
         break;
     case BufferMethods::WaitForIdle:
-        dma_pusher.rasterizer->WaitForIdle();
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
         break;
     case BufferMethods::SemaphoreOperation: {
         ProcessSemaphoreTriggerMethod(dma_pusher);
@@ -347,25 +409,32 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     }
     case BufferMethods::MemOpA: {
-        if (static std::atomic<u32> log_count_Memory_Operation_A{}; log_count_Memory_Operation_A.fetch_add(1, std::memory_order_relaxed) < 32) LOG_ERROR(HW_GPU, "Memory Operation A");
+        LOG_TRACE(HW_GPU, "Memory Operation A");
         break;
     }
     case BufferMethods::MemOpB: {
         // Implement this better.
-        dma_pusher.rasterizer->InvalidateGPUCache();
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); });
         break;
     }
     case BufferMethods::MemOpC:
     case BufferMethods::MemOpD: {
-        if (static std::atomic<u32> log_count_Memory_Operation_C_D{}; log_count_Memory_Operation_C_D.fetch_add(1, std::memory_order_relaxed) < 32) LOG_ERROR(HW_GPU, "Memory Operation C,D");
+        LOG_TRACE(HW_GPU, "Memory Operation C,D");
         break;
     }
     case BufferMethods::SemaphoreAcquire: {
-        ProcessSemaphoreAcquire(dma_pusher);
+        // On Ampere host classes 0x17..0x1A are SEM_ADDR_LO/HI and SEM_PAYLOAD_LO/HI.
+        if (!g_nx2_ampere) {
+            ProcessSemaphoreAcquire(dma_pusher);
+        }
         break;
     }
     case BufferMethods::SemaphoreRelease: {
-        ProcessSemaphoreRelease(dma_pusher);
+        if (g_nx2_ampere) {
+            ProcessSemaphoreExecute(dma_pusher, method_call.argument);
+        } else {
+            ProcessSemaphoreRelease(dma_pusher);
+        }
         break;
     }
     case BufferMethods::Yield: {
@@ -375,30 +444,37 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     default:
         LOG_ERROR(HW_GPU, "Special puller engine method {:X} not implemented", method);
+        if (static bool dumped = false; g_nx2_ampere && !dumped) {
+            dumped = true;
+            dma_pusher.DumpCurrentEntry("unknown host method");
+        }
         break;
     }
 }
 
 /// Calls a GPU engine method.
+static bool Nx2MethodTrace() {
+    static const bool trace = std::getenv("EDEN_NX2_METHOD_TRACE") != nullptr;
+    return trace;
+}
+
 void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
     const EngineID engine = bound_engines[method_call.subchannel];
+    if (Nx2MethodTrace()) {
+        LOG_INFO(HW_GPU, "nx2 method sub={} engine={:04X} method={:#x} arg={:#x}",
+                 method_call.subchannel, static_cast<u32>(engine), method_call.method,
+                 method_call.argument);
+    }
     switch (engine) {
     case EngineID::FERMI_TWOD_A:
         dma_pusher.channel_state.payload->fermi_2d.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
         break;
-    case EngineID::AMPERE_B:
     case EngineID::MAXWELL_B:
         dma_pusher.channel_state.payload->maxwell_3d.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
         break;
-    case EngineID::AMPERE_COMPUTE_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        [[fallthrough]];
     case EngineID::KEPLER_COMPUTE_B:
         dma_pusher.channel_state.payload->kepler_compute.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
         break;
-    case EngineID::AMPERE_DMA_COPY_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        [[fallthrough]];
     case EngineID::MAXWELL_DMA_COPY_A:
         dma_pusher.channel_state.payload->maxwell_dma.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
         break;
@@ -417,23 +493,20 @@ void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
 /// Calls a GPU engine multivalue method.
 void Puller::CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending) {
     const EngineID engine = bound_engines[subchannel];
+    if (Nx2MethodTrace()) {
+        LOG_INFO(HW_GPU, "nx2 multimethod sub={} engine={:04X} method={:#x} amount={} first={:#x}",
+                 subchannel, static_cast<u32>(engine), method, amount, base_start[0]);
+    }
     switch (engine) {
     case EngineID::FERMI_TWOD_A:
         dma_pusher.channel_state.payload->fermi_2d.CallMultiMethod(dma_pusher.system, method, base_start, amount, methods_pending);
         break;
-    case EngineID::AMPERE_B:
     case EngineID::MAXWELL_B:
         dma_pusher.channel_state.payload->maxwell_3d.CallMultiMethod(dma_pusher.system, method, base_start, amount, methods_pending);
         break;
-    case EngineID::AMPERE_COMPUTE_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        [[fallthrough]];
     case EngineID::KEPLER_COMPUTE_B:
         dma_pusher.channel_state.payload->kepler_compute.CallMultiMethod(dma_pusher.system, method, base_start, amount, methods_pending);
         break;
-    case EngineID::AMPERE_DMA_COPY_B:
-        if (!dma_pusher.channel_state.native_abi) { UNIMPLEMENTED_MSG("Native GPU class on legacy channel"); return; }
-        [[fallthrough]];
     case EngineID::MAXWELL_DMA_COPY_A:
         dma_pusher.channel_state.payload->maxwell_dma.CallMultiMethod(dma_pusher.system, method, base_start, amount, methods_pending);
         break;

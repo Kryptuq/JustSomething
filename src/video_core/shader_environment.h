@@ -7,7 +7,6 @@
 #pragma once
 
 #include <array>
-#include <unordered_map>
 #include <filesystem>
 #include <iosfwd>
 #include <limits>
@@ -15,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -29,6 +29,29 @@ class Memorymanager;
 }
 
 namespace VideoCommon {
+
+/// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
+/// it so the environments built for the program's pipelines don't capture and lower it again.
+struct LoweredNativeCode {
+    /// Shader header, lowered instructions with Maxwell scheduling words, then the native
+    /// address map (what the environment's `code` used to be filled with).
+    std::vector<u64> code;
+    /// Bytes of the native program that were read, header included.
+    size_t source_size{};
+    /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
+    /// (the engine's register value is used).
+    u32 texture_bound = ~0U;
+};
+
+/// The guest memory the calling thread's last native capture read: the program's header and every
+/// instruction up to where capture or lowering stopped (or failed). A rejection depends on these
+/// bytes only.
+struct NativeCaptureRange {
+    GPUVAddr start{};
+    u64 size{};
+};
+void ResetLastNativeCapture();
+NativeCaptureRange LastNativeCapture();
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -49,7 +72,12 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) final;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
+
     [[nodiscard]] std::span<const Shader::IR::RegisterRemap> RegisterRemaps(u32 address) const override;
+
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -65,8 +93,8 @@ public:
         return native_source_size;
     }
 
-    [[nodiscard]] bool IsNativeProgram() const override {
-        return native_source_size != 0;
+    [[nodiscard]] const std::shared_ptr<const LoweredNativeCode>& LoweredNative() const noexcept {
+        return lowered_native;
     }
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
@@ -84,8 +112,12 @@ public:
 protected:
     std::optional<u64> TryFindSize();
 
-    void InitializeNativeCode(u32 source_header_size = 128);
+    /// Adopts an already lowered native program, or captures and lowers it when there is none.
+    void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
+                              u32 source_header_size = 128);
+    std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size);
     size_t native_source_size{};
+    std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                              bool via_header_index, u32 raw);
@@ -94,10 +126,12 @@ protected:
     GPUVAddr program_base{};
 
     std::vector<u64> code;
+    /// Lowered native programs: register redirections per instruction address (stored in code).
     std::unordered_map<u32, std::vector<Shader::IR::RegisterRemap>> register_remaps;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u64, u8> storage_pointer_types; ///< IsCbufStorageBufferPointer answers
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
 
     u32 local_memory_size{};
@@ -124,7 +158,8 @@ public:
     explicit GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                  Tegra::MemoryManager& gpu_memory_,
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
-                                 GPUVAddr program_base_, u32 start_address_);
+                                 GPUVAddr program_base_, u32 start_address_,
+                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~GraphicsEnvironment() override = default;
 
@@ -150,7 +185,8 @@ public:
     explicit ComputeEnvironment() = default;
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                u32 start_address_);
+                                u32 start_address_,
+                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~ComputeEnvironment() override = default;
 
@@ -189,10 +225,12 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
+
     [[nodiscard]] std::span<const Shader::IR::RegisterRemap> RegisterRemaps(u32 address) const override;
 
-    /// Cached native programs end with the native address map.
-    [[nodiscard]] bool IsNativeProgram() const override;
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
@@ -227,6 +265,7 @@ private:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u64, u8> storage_pointer_types;
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
     std::array<u32, 3> workgroup_size{};
     u32 local_memory_size{};

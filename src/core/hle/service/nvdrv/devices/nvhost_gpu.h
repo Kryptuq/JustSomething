@@ -6,9 +6,8 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
@@ -22,10 +21,7 @@ namespace Core::Memory {
 class Memory;
 }
 
-namespace Kernel { class KProcess; }
-
 namespace Tegra {
-struct NativeMacroContext;
 namespace Control {
 struct ChannelState;
 }
@@ -63,12 +59,9 @@ public:
     void OnClose(DeviceFD fd) override;
 
     Kernel::KEvent* QueryEvent(u32 event_id) override;
-    NvResult BindToTsg(DeviceFD group, Kernel::KProcess* process, std::shared_ptr<Tegra::NativeMacroContext> macros);
-    void UnbindFromTsg(DeviceFD group);
 
 private:
     friend class nvhost_as_gpu;
-    bool UsesNativeAbi() const;
     enum class CtxClasses : u32_le {
         Ctx2D = 0x902D,
         Ctx3D = 0xB197,
@@ -226,9 +219,6 @@ private:
     NvCore::NvMap& nvmap;
     std::shared_ptr<Tegra::Control::ChannelState> channel_state;
     ::Common::unordered_map<DeviceFD, NvCore::SessionId> sessions;
-    std::mutex tsg_mutex;
-    std::optional<DeviceFD> tsg_group;
-    u32 native_submit_logs{};
     u32 channel_syncpoint;
     std::mutex channel_mutex;
 
@@ -236,6 +226,7 @@ private:
     Kernel::KEvent* sm_exception_breakpoint_int_report_event;
     Kernel::KEvent* sm_exception_breakpoint_pause_report_event;
     Kernel::KEvent* error_notifier_event;
+    std::map<u32, Kernel::KEvent*> nx2_events;
 };
 
 } // namespace Service::Nvidia::Devices

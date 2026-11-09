@@ -31,7 +31,6 @@ std::pair<Id, Id> ExtractArgs(EmitContext& ctx, Id offset, u32 mask, u32 count) 
 } // Anonymous namespace
 
 Id EmitLoadSharedU8(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 1);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{
             ctx.OpAccessChain(ctx.shared_u8, ctx.shared_memory_u8, ctx.u32_zero_value, offset)};
@@ -43,7 +42,6 @@ Id EmitLoadSharedU8(EmitContext& ctx, Id offset) {
 }
 
 Id EmitLoadSharedS8(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 1);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{
             ctx.OpAccessChain(ctx.shared_u8, ctx.shared_memory_u8, ctx.u32_zero_value, offset)};
@@ -55,7 +53,6 @@ Id EmitLoadSharedS8(EmitContext& ctx, Id offset) {
 }
 
 Id EmitLoadSharedU16(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 2);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u16, ctx.shared_memory_u16, offset, 1)};
         return ctx.OpUConvert(ctx.U32[1], ctx.OpLoad(ctx.U16, pointer));
@@ -66,7 +63,6 @@ Id EmitLoadSharedU16(EmitContext& ctx, Id offset) {
 }
 
 Id EmitLoadSharedS16(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 2);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u16, ctx.shared_memory_u16, offset, 1)};
         return ctx.OpSConvert(ctx.U32[1], ctx.OpLoad(ctx.U16, pointer));
@@ -77,7 +73,6 @@ Id EmitLoadSharedS16(EmitContext& ctx, Id offset) {
 }
 
 Id EmitLoadSharedU32(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 4);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u32, ctx.shared_memory_u32, offset, 2)};
         return ctx.OpLoad(ctx.U32[1], pointer);
@@ -87,7 +82,6 @@ Id EmitLoadSharedU32(EmitContext& ctx, Id offset) {
 }
 
 Id EmitLoadSharedU64(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 8);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u32x2, ctx.shared_memory_u32x2, offset, 3)};
         return ctx.OpLoad(ctx.U32[2], pointer);
@@ -103,7 +97,6 @@ Id EmitLoadSharedU64(EmitContext& ctx, Id offset) {
 }
 
 Id EmitLoadSharedU128(EmitContext& ctx, Id offset) {
-    offset = ctx.SharedOffset(offset, 16);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u32x4, ctx.shared_memory_u32x4, offset, 4)};
         return ctx.OpLoad(ctx.U32[4], pointer);
@@ -120,7 +113,6 @@ Id EmitLoadSharedU128(EmitContext& ctx, Id offset) {
 }
 
 void EmitWriteSharedU8(EmitContext& ctx, Id offset, Id value) {
-    offset = ctx.SharedOffset(offset, 1);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{
             ctx.OpAccessChain(ctx.shared_u8, ctx.shared_memory_u8, ctx.u32_zero_value, offset)};
@@ -131,7 +123,6 @@ void EmitWriteSharedU8(EmitContext& ctx, Id offset, Id value) {
 }
 
 void EmitWriteSharedU16(EmitContext& ctx, Id offset, Id value) {
-    offset = ctx.SharedOffset(offset, 2);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u16, ctx.shared_memory_u16, offset, 1)};
         ctx.OpStore(pointer, ctx.OpUConvert(ctx.U16, value));
@@ -141,7 +132,6 @@ void EmitWriteSharedU16(EmitContext& ctx, Id offset, Id value) {
 }
 
 void EmitWriteSharedU32(EmitContext& ctx, Id offset, Id value) {
-    offset = ctx.SharedOffset(offset, 4);
     Id pointer{};
     if (ctx.uses_explicit_workgroup_layout) {
         pointer = Pointer(ctx, ctx.shared_u32, ctx.shared_memory_u32, offset, 2);
@@ -154,7 +144,6 @@ void EmitWriteSharedU32(EmitContext& ctx, Id offset, Id value) {
 }
 
 void EmitWriteSharedU64(EmitContext& ctx, Id offset, Id value) {
-    offset = ctx.SharedOffset(offset, 8);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u32x2, ctx.shared_memory_u32x2, offset, 3)};
         ctx.OpStore(pointer, value);
@@ -170,7 +159,6 @@ void EmitWriteSharedU64(EmitContext& ctx, Id offset, Id value) {
 }
 
 void EmitWriteSharedU128(EmitContext& ctx, Id offset, Id value) {
-    offset = ctx.SharedOffset(offset, 16);
     if (ctx.uses_explicit_workgroup_layout) {
         const Id pointer{Pointer(ctx, ctx.shared_u32x4, ctx.shared_memory_u32x4, offset, 4)};
         ctx.OpStore(pointer, value);

@@ -7,7 +7,12 @@
 #pragma once
 
 #include <memory>
+#include "video_core/macro_memo.h"
 #include "video_core/macro_turing.h"
+
+namespace Tegra {
+class TuringMacroJit;
+}
 #include <span>
 #include <variant>
 #include <vector>
@@ -226,6 +231,7 @@ struct MacroEngine {
     inline void AddCode(u32 method, u32 data) noexcept {
         if (native_turing) {
             if (native_write_offset < native_code.size()) native_code[native_write_offset++] = data;
+            ++native_code_generation;
             return;
         }
         uploaded_macro_code[method].push_back(data);
@@ -250,8 +256,15 @@ struct MacroEngine {
     bool native_execution_failed{};
     u32 native_write_offset{};
     std::array<u32, 0x3000> native_code{};
-    const std::array<u32, 0x3000>& NativeCode() const { return native_code; }
     TuringMacroInterpreter native_interpreter;
+    std::vector<u32> native_fifo;
+    // Calls replayed instead of interpreted (macro_memo.h), and what the current call wrote.
+    u64 native_code_generation{};
+    BasicMacroMemo<::Common::unordered_map<u64, u32, MacroMemoHash>> native_memo;
+    /// The macro code compiled to x86-64 (EDEN_NX2_MME_JIT=0 turns it off), created on first use.
+    std::shared_ptr<TuringMacroJit> native_jit;
+    MacroMemoPairs native_writes;
+    u64 native_calls{};
 
 };
 

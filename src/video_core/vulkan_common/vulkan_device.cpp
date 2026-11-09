@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -30,6 +32,9 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
 #include <adrenotools/bcenabler.h>
@@ -409,6 +414,16 @@ std::filesystem::path StaticPipelineCacheFilename() {
     return shader_dir / "vulkan_static_pipelines.bin";
 }
 
+// What a heap's allocations use. The driver also counts the space in VMA's blocks no allocation
+// uses, but freeing an image gives its share back only once its whole block is empty: the caches,
+// collecting until the usage dropped, evicted thousands of textures in a row without lowering it
+// (title 1).
+u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
+    const VmaStatistics& statistics = vma_budget.statistics;
+    const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+    return driver_usage - (std::min)(driver_usage, unused);
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -608,12 +623,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     sets_per_pool = 64;
+    // AMD GCN4 and older are told apart by their lack of float16, read before float16 is turned
+    // off for newer AMD drivers below: checked after that, every AMD GPU looked like GCN4 and lost
+    // VK_EXT_sampler_filter_minmax (an RDNA3 Radeon 780M logged it).
+    const bool amd_gcn4_or_older = is_amd && !features.shader_float16_int8.shaderFloat16;
     if (is_amd_driver) {
         // AMD drivers need a higher amount of Sets per Pool in certain circumstances like in XC2.
         sets_per_pool = 96;
 
         // Disable VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT on AMD GCN4 and lower as it is broken.
-        if (!features.shader_float16_int8.shaderFloat16) {
+        if (amd_gcn4_or_older) {
             LOG_WARNING(Render_Vulkan,
                         "AMD GCN4 and earlier have broken VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT");
             has_broken_cube_compatibility = true;
@@ -629,7 +648,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     if (extensions.sampler_filter_minmax && is_amd) {
         // Disable ext_sampler_filter_minmax on AMD GCN4 and lower as it is broken.
-        if (!features.shader_float16_int8.shaderFloat16) {
+        if (amd_gcn4_or_older) {
             LOG_WARNING(Render_Vulkan,
                         "AMD GCN4 and earlier have broken VK_EXT_sampler_filter_minmax");
             RemoveExtension(extensions.sampler_filter_minmax,
@@ -727,6 +746,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+#ifdef EGLANTINE_STREAMLINE
+    // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
+    // it, but leave Eglantine's own buffers as they are without descriptor buffers.
+    const bool dlss_wants_device_address =
+        streamline_extensions && features.buffer_device_address.bufferDeviceAddress;
+    if (!extensions.descriptor_buffer && dlss_wants_device_address) {
+        extensions.buffer_device_address = false;
+    } else
+#endif
     if (!extensions.descriptor_buffer) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
@@ -736,6 +764,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+
+#ifdef EGLANTINE_STREAMLINE
+    if (streamline_extensions) {
+        streamline_attached =
+            Streamline::AttachDevice(instance, physical, *logical, graphics_family, dld);
+    } else if (Streamline::WantsDevice()) {
+        Streamline::Stop();
+    }
+#endif
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
@@ -748,16 +785,32 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
+    // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
+    heap_size_limits.fill(VK_WHOLE_SIZE);
+    if (heap_size_limit != 0) {
+        const auto memory_properties = physical.GetMemoryProperties().memoryProperties;
+        for (u32 heap = 0; heap < memory_properties.memoryHeapCount; ++heap) {
+            if (memory_properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                heap_size_limits[heap] = heap_size_limit;
+            }
+        }
+    }
     const VmaAllocatorCreateInfo allocator_info{
             .flags = flags,
             .physicalDevice = physical,
             .device = *logical,
-            .preferredLargeHeapBlockSize = is_integrated
-                                           ? (64u * 1024u * 1024u)
-                                           : (256u * 1024u * 1024u),
+            // 16 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
+            // texture sizes left ~38% of the image blocks empty (2 GB of an 8 GB card in title
+            // 1), which the texture cache counted as used and kept evicting textures for. With
+            // 64 MiB ones textures created and deleted by the thousand still left ~1.7 GB of holes
+            // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
+            // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
+            // block (8 MiB) their own memory, which goes back to the driver when they are freed.
+            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
-            .pHeapSizeLimit = nullptr,
+            .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
             .pVulkanFunctions = &functions,
             .instance = instance,
             .vulkanApiVersion = ApiVersion(),
@@ -769,23 +822,47 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
 
-    if (owns_static_pipeline_cache) {
-        // The rendering device: report the driver's fault description when a Vulkan call fails
-        // with VK_ERROR_DEVICE_LOST (those calls throw instead of reaching ReportLoss).
-        vk::SetDeviceLostHandler([this] { LogDeviceFault("VK_ERROR_DEVICE_LOST raised"); });
-    }
-
     // Initialize GPU logging if enabled
     InitializeGPULogging();
 }
 
 Device::~Device() {
-    if (owns_static_pipeline_cache) {
-        vk::SetDeviceLostHandler({});
+#ifdef EGLANTINE_STREAMLINE
+    if (streamline_attached) {
+        Streamline::Stop();
     }
+#endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    for (auto& pools : separate_pools) {
+        for (VmaPool pool : pools) {
+            if (pool != VK_NULL_HANDLE) {
+                vmaDestroyPool(allocator, pool);
+            }
+        }
+    }
     vmaDestroyAllocator(allocator);
+}
+
+VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+    std::scoped_lock lk{separate_pools_mutex};
+    VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
+    if (pool == VK_NULL_HANDLE) {
+        const VmaPoolCreateInfo ci{
+            .memoryTypeIndex = memory_type,
+            .flags = 0,
+            .blockSize = SeparatePoolBlockSize,
+            .minBlockCount = 0,
+            .maxBlockCount = 0,
+            .priority = 0.f,
+            .minAllocationAlignment = 0,
+            .pMemoryAllocateNext = nullptr,
+        };
+        if (vmaCreatePool(allocator, &ci, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+        }
+    }
+    return pool;
 }
 
 void Device::LoadStaticPipelineCache() {
@@ -905,82 +982,9 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
-    LogDeviceFault("device loss");
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
     std::this_thread::sleep_for(std::chrono::seconds{15});
-}
-
-std::optional<std::pair<u64, u64>> Device::ImageViewAddress(VkImageView view) const {
-    if (!extensions.image_view_handle || view == VK_NULL_HANDLE) {
-        return std::nullopt;
-    }
-    VkImageViewAddressPropertiesNVX view_address{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_ADDRESS_PROPERTIES_NVX,
-        .pNext = nullptr,
-        .deviceAddress = 0,
-        .size = 0,
-    };
-    if (logical.GetImageViewAddress(view, view_address) != VK_SUCCESS) {
-        return std::nullopt;
-    }
-    return std::make_pair(static_cast<u64>(view_address.deviceAddress), static_cast<u64>(view_address.size));
-}
-
-bool Device::LogDeviceFault(const char* context) const {
-    if (!SupportsDeviceFaultReports()) {
-        LOG_ERROR(Render_Vulkan, "Device fault report ({}): not supported by the driver", context);
-        return false;
-    }
-    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-    VkResult result = logical.GetFaultInfo(&counts, nullptr);
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
-        LOG_ERROR(Render_Vulkan, "Device fault report ({}): query failed ({})", context, static_cast<int>(result));
-        return false;
-    }
-    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
-    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
-    counts.vendorBinarySize = 0;
-    VkDeviceFaultInfoEXT info{
-        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
-        .pNext = nullptr,
-        .description = {},
-        .pAddressInfos = addresses.empty() ? nullptr : addresses.data(),
-        .pVendorInfos = vendor.empty() ? nullptr : vendor.data(),
-        .pVendorBinaryData = nullptr,
-    };
-    result = logical.GetFaultInfo(&counts, &info);
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
-        LOG_ERROR(Render_Vulkan, "Device fault report ({}): query failed ({})", context, static_cast<int>(result));
-        return false;
-    }
-    if (info.description[0] == '\0' && counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
-        return false;
-    }
-    const auto address_type = [](VkDeviceFaultAddressTypeEXT type) {
-        switch (type) {
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
-        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
-        default: return "other";
-        }
-    };
-    LOG_ERROR(Render_Vulkan, "Device fault report ({}): \"{}\", {} addresses, {} vendor entries",
-              context, info.description, counts.addressInfoCount, counts.vendorInfoCount);
-    for (u32 i = 0; i < counts.addressInfoCount; ++i) {
-        LOG_ERROR(Render_Vulkan, "Device fault report:   address {:#x} (precision {:#x}): {}",
-                  addresses[i].reportedAddress, addresses[i].addressPrecision,
-                  address_type(addresses[i].addressType));
-    }
-    for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
-        LOG_ERROR(Render_Vulkan, "Device fault report:   vendor \"{}\" code {:#x} data {:#x}",
-                  vendor[i].description, vendor[i].vendorFaultCode, vendor[i].vendorFaultData);
-    }
-    return true;
 }
 
 void Device::SaveShader(std::span<const u32> spirv) const {
@@ -1128,17 +1132,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
-    // Device fault reports for GPU hang/crash diagnostics.
-    if (supported_extensions.contains(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
-        loaded_extensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
-        extensions.device_fault = true;
-    }
-    // NVIDIA image view GPU addresses, to map a faulting GPU address to an image (diagnostics).
-    if (supported_extensions.contains(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME)) {
-        loaded_extensions.insert(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME);
-        extensions.image_view_handle = true;
-    }
-
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1155,6 +1148,26 @@ bool Device::GetSuitability(bool requires_swapchain) {
     } else {
         extensions.robustness_2 = false;
     }
+
+#ifdef EGLANTINE_STREAMLINE
+    // The extensions NVIDIA's DLSS asks for, where the device has them all.
+    if (Streamline::WantsDevice()) {
+        const std::vector<std::string> wanted = Streamline::DeviceExtensions();
+        // Streamline may ask for no extensions at all.
+        const bool all = std::ranges::all_of(
+            wanted, [&](const std::string& name) { return supported_extensions.contains(name); });
+        std::string names;
+        for (const std::string& name : wanted) {
+            if (all) {
+                loaded_extensions.insert(name);
+            }
+            names += (names.empty() ? "" : ", ") + name;
+        }
+        streamline_extensions = all;
+        LOG_INFO(Render_Vulkan, "NVIDIA DLSS device extensions: {} ({})",
+                 all ? "enabled" : "unavailable", names.empty() ? "none" : names);
+    }
+#endif
 
 #undef FEATURE_EXTENSION
 #undef EXTENSION
@@ -1217,10 +1230,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     FOR_EACH_VK_FEATURE_1_1(FEATURE);
     FOR_EACH_VK_FEATURE_EXT(EXT_FEATURE);
-    if (extensions.device_fault) {
-        features.device_fault.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
-        SetNext(next, features.device_fault);
-    }
     if (instance_version >= VK_API_VERSION_1_2) {
         FOR_EACH_VK_FEATURE_1_2(FEATURE);
     } else {
@@ -1237,8 +1246,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // Perform the feature test.
     physical.GetFeatures2(features2);
-    // Fault reports are only used for their description and addresses.
-    features.device_fault.deviceFaultVendorBinary = VK_FALSE;
 
     // Base Vulkan 1.0 features are always valid regardless of instance version.
     features.features = features2.features;
@@ -1586,6 +1593,15 @@ void Device::RemoveUnsuitableExtensions() {
                                VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
 
+    // VK_EXT_mesh_shader: Switch 2 titles draw some geometry with task and mesh programs. Only
+    // the two stages are used; the multiview, shading rate and query features need more.
+    features.mesh_shader.multiviewMeshShader = VK_FALSE;
+    features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+    features.mesh_shader.meshShaderQueries = VK_FALSE;
+    extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
+    RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
+                                       VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
     // VK_KHR_shader_quad_control
     extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
@@ -1700,13 +1716,60 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
 }
 
 u64 Device::GetDeviceMemoryUsage() const {
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    budget.pNext = nullptr;
     physical.GetMemoryProperties(&budget);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
-        result += budget.heapUsage[heap];
+        result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+    }
+    return result;
+}
+
+u64 Device::GetDeviceMemorySlack() const {
+    if (allocator == nullptr) {
+        return 0;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    vmaGetHeapBudgets(allocator, heap_budgets.data());
+    const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
+    return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
+}
+
+u64 Device::GetDeviceMemoryBudget() const {
+    if (!extensions.memory_budget) {
+        return 0;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(&budget);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
+    // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
+    // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
+    // the other heaps use is added the way GetDeviceMemoryUsage() counts it, so the usage reaches
+    // this when the main heap's does its budget.
+    u64 result = budget.heapBudget[main_heap];
+    if (heap_size_limit != 0) {
+        result = (std::min)(result, heap_size_limit);
+    }
+    for (const size_t heap : valid_heap_memory) {
+        if (heap != main_heap) {
+            result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        }
+    }
+    if (is_integrated) {
+        // An integrated GPU's device-local heap is system memory (a Radeon 780M reported a 21 GB
+        // budget): following it let the texture cache fill that much RAM before collecting, and
+        // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
+        // gives it (4 GiB, 6 GiB with aggressive VRAM use).
+        result = (std::min)(result, device_access_memory);
     }
     return result;
 }
@@ -1722,6 +1785,20 @@ void Device::CollectPhysicalMemoryInfo() {
     device_access_memory = 0;
     u64 device_initial_usage = 0;
     u64 local_memory = 0;
+    // EDEN_NX2_VRAM_LIMIT_MIB=<n>: treat every device-local heap as n MiB (small card tests).
+    if (const char* value = std::getenv("EDEN_NX2_VRAM_LIMIT_MIB")) {
+        heap_size_limit = std::strtoull(value, nullptr, 10) << 20;
+        if (heap_size_limit != 0) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB: device-local heaps limited to {} MiB",
+                     heap_size_limit >> 20);
+        } else {
+            LOG_WARNING(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB={} is not a size in MiB, ignored",
+                        value);
+        }
+    }
+    const auto limit = [this](u64 size) {
+        return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;
+    };
     for (size_t element = 0; element < num_properties; ++element) {
         const bool is_heap_local =
             (mem_properties.memoryHeaps[element].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
@@ -1729,15 +1806,22 @@ void Device::CollectPhysicalMemoryInfo() {
             continue;
         }
         valid_heap_memory.push_back(element);
+        const VkMemoryHeap& main = mem_properties.memoryHeaps[main_heap];
+        u64 heap_size = mem_properties.memoryHeaps[element].size;
         if (is_heap_local) {
-            local_memory += mem_properties.memoryHeaps[element].size;
+            if ((main.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || heap_size > main.size) {
+                main_heap = element;
+            }
+            heap_size = limit(heap_size);
+            local_memory += heap_size;
         }
         if (extensions.memory_budget) {
             device_initial_usage += budget.heapUsage[element];
-            device_access_memory += budget.heapBudget[element];
+            device_access_memory += is_heap_local ? limit(budget.heapBudget[element])
+                                                  : budget.heapBudget[element];
             continue;
         }
-        device_access_memory += mem_properties.memoryHeaps[element].size;
+        device_access_memory += heap_size;
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);

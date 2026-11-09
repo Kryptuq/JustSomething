@@ -8,6 +8,8 @@
 
 #include <optional>
 #include <span>
+#include <utility>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
@@ -35,6 +37,9 @@ struct OverlapResult {
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
+
+/// True if no 16-byte ASTC block in `data` decodes to alpha below 1.
+[[nodiscard]] bool AstcDataLooksOpaque(std::span<const u8> data) noexcept;
 
 [[nodiscard]] u32 CalculateLayerStride(const ImageInfo& info) noexcept;
 
@@ -68,6 +73,28 @@ struct OverlapResult {
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output);
+
+/// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
+/// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into
+/// runs along x. Levels from tail_level on (the host's mip tail) come whole.
+[[nodiscard]] std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
+                                                     std::span<const std::pair<u64, u64>> ranges,
+                                                     u32 tile_width, u32 tile_height,
+                                                     s32 tail_level);
+
+/// Bytes UnswizzleImageRects writes for `rects`.
+[[nodiscard]] size_t UnswizzledRectsBytes(const ImageInfo& info, std::span<const LevelRect> rects);
+
+/// Unswizzles `rects` (from SparseTileRects: on GOB columns) of a single-layer 2D block-linear
+/// image into output, reading only the guest blocks under them.
+[[nodiscard]] std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memory,
+                                                               GPUVAddr gpu_addr,
+                                                               const ImageInfo& info,
+                                                               std::span<const LevelRect> rects,
+                                                               std::span<u8> output);
+
+/// Rewrites `copies` (from UnswizzleImage) to the layout ConvertImage produces, without converting.
+void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies);
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies);

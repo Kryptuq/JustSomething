@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Warp-level matrix operations of native Switch 2 programs (Ampere HMMA / LDSM). The native
-// lowering encodes them as NS2_HMMA / NS2_LDSM in an opcode range unused by Maxwell; they are
-// emulated here with subgroup shuffles, using the fragment layouts of PTX mma.m16n8k16 and
-// ldmatrix. All 32 lanes of the warp must execute them together, as on hardware.
+// Warp-level matrix multiply of native Switch 2 programs (Ampere HMMA), ported from EdenNS2 main
+// (HMMA only; this branch lowers LDSM itself). The native lowering encodes it as NS2_HMMA in an
+// opcode range unused by Maxwell; it is emulated here with subgroup shuffles, using the fragment
+// layout of PTX mma.m16n8k16. All 32 lanes of the warp must execute it together, as on hardware.
 
 #include <tuple>
 
@@ -93,41 +93,6 @@ void TranslatorVisitor::NS2_HMMA(u64 insn) {
     } else {
         X(hmma.dest, PackHalves(ir, acc[0], acc[1]));
         X(hmma.dest + 1, PackHalves(ir, acc[2], acc[3]));
-    }
-}
-
-void TranslatorVisitor::NS2_LDSM(u64 insn) {
-    union {
-        u64 raw;
-        BitField<0, 8, IR::Reg> dest;
-        BitField<8, 8, IR::Reg> address;
-        BitField<20, 24, s64> offset;
-        BitField<44, 2, u64> count;
-        BitField<46, 1, u64> transpose;
-    } const ldsm{insn};
-    // ldmatrix .b16 m8n8: lanes 8i..8i+7 hold the row addresses of matrix i; lane t receives
-    // row t / 4, columns 2 * (t % 4) and + 1 of each matrix (transposed: rows 2 * (t % 4) and
-    // + 1, column t / 4).
-    const u32 matrices{1U << ldsm.count};
-    const IR::U32 lane{ir.LaneId()};
-    const IR::U32 row{ir.ShiftRightLogical(lane, ir.Imm32(2))};
-    const IR::U32 pair{ir.BitwiseAnd(lane, ir.Imm32(3))};
-    const IR::U32 address{ir.IAdd(X(ldsm.address), ir.Imm32(static_cast<s32>(ldsm.offset)))};
-    for (u32 i = 0; i < matrices; ++i) {
-        IR::U32 value;
-        if (ldsm.transpose == 0) {
-            const IR::U32 row_address{FromLane(ir, address, ir.IAdd(row, ir.Imm32(8 * i)))};
-            value = IR::U32{ir.LoadShared(32, false, ir.IAdd(row_address, ir.ShiftLeftLogical(pair, ir.Imm32(2))))};
-        } else {
-            const IR::U32 first_row{ir.IAdd(ir.ShiftLeftLogical(pair, ir.Imm32(1)), ir.Imm32(8 * i))};
-            const IR::U32 column_offset{ir.ShiftLeftLogical(row, ir.Imm32(1))};
-            const IR::U32 low_address{FromLane(ir, address, first_row)};
-            const IR::U32 high_address{FromLane(ir, address, ir.IAdd(first_row, ir.Imm32(1)))};
-            const IR::U32 low{ir.LoadShared(16, false, ir.IAdd(low_address, column_offset))};
-            const IR::U32 high{ir.LoadShared(16, false, ir.IAdd(high_address, column_offset))};
-            value = ir.BitwiseOr(low, ir.ShiftLeftLogical(high, ir.Imm32(16)));
-        }
-        X(ldsm.dest + i, value);
     }
 }
 

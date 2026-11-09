@@ -72,14 +72,15 @@ public:
                     KernelCapabilityDescriptors capabilities);
 
     bool Is64BitProgram() const;
+    /// True when the NPDM uses the Switch 2 ACID layout.
+    bool IsSwitch2() const {
+        return is_switch2;
+    }
     ProgramAddressSpaceType GetAddressSpaceType() const;
     u8 GetMainThreadPriority() const;
     u8 GetMainThreadCore() const;
     u32 GetMainThreadStackSize() const;
     u64 GetTitleID() const;
-    bool UsesExtendedAcid() const {
-        return uses_extended_acid;
-    }
     u64 GetFilesystemPermissions() const;
     u32 GetSystemResourceSize() const;
     PoolPartition GetPoolPartition() const;
@@ -119,6 +120,8 @@ private:
     static_assert(sizeof(Header) == 0x80, "NPDM header structure size is wrong");
 
     struct AcidHeader {
+        std::array<u8, 0x100> signature;
+        std::array<u8, 0x100> nca_modulus;
         std::array<char, 4> magic;
         u32_le nca_size;
         std::array<u8, 0x4> reserved;
@@ -140,7 +143,7 @@ private:
         INSERT_PADDING_BYTES(0x8);
     };
 
-    static_assert(sizeof(AcidHeader) == 0x40, "ACID header body size is wrong");
+    static_assert(sizeof(AcidHeader) == 0x240, "ACID header structure size is wrong");
 
     struct AciHeader {
         std::array<char, 4> magic;
@@ -178,9 +181,9 @@ private:
     };
 
     Header npdm_header{};
-    bool uses_extended_acid{};
     AciHeader aci_header{};
     AcidHeader acid_header{};
+    bool is_switch2{};
 
     FileAccessControl acid_file_access{};
     FileAccessHeader aci_file_access{};

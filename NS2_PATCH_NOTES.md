@@ -765,3 +765,46 @@ Logged (no behaviour change), the same trace as yoshi-int-build-20, to compare t
   reach the JIT's memory callbacks, with registers and the frame-pointer chain.
 - "NS2 writer trace: ... draw ... reads stage S slot N at <address> ...": draws reading constant
   buffers in those pages, with the first 8 words they read.
+
+## Build 124 (new base: Eglantine + the Yoshi fixes; diagnostics removed)
+From this build on, `main` is the Yoshi integration branch: Eglantine (Djihads80/Eglantine `nx2`,
+mirrored as `eglantine-upstream`) with the EdenNS2 Yoshi fixes ported onto it, then cleaned of the
+temporary diagnostics. Details of every port and of yoshi-int-build-1 to 41: `YOSHI_INTEGRATION.md`.
+The previous EdenNS2 tree (builds 1-123) is kept as tag `edenns2-classic` (3aa992ab) and stays
+the first-parent history of `main`.
+
+What changes for the user:
+- The executable is `eglantine.exe` (as in the yoshi-int builds). Settings, keys, logs and caches
+  stay in `%APPDATA%\eden` (log: `%APPDATA%\eden\log\eden_log.txt`).
+- Disk pipeline caches written before yoshi-int-build-40 are discarded once (CACHE_VERSION 21);
+  caches written by yoshi-int-build-40/41 are reused.
+- No environment variable or setting is needed. Optional overrides: EDEN_NS2_SNAPSHOT_RULE,
+  EDEN_NX2_SEMAPHORE_MIRROR, EDEN_NX2_BUFFER_DOWNLOADS (comparisons only).
+
+Yoshi result (user, yoshi-int-build-40, full version 0400245021D2C000): the Book renders with the
+persistent pipeline cache on, no gameplay flicker, no red/yellow ghosting or blur, ~55-60 FPS with
+occasional drops; overall the same as build 123.
+
+The three fixes that completed it (all in this build):
+- c6e552ef, flicker: GPU-written buffer ranges are downloaded at fences for Switch 2 titles again.
+  Without the fence downloads a GPU-written range stayed marked until something flushed it, and a
+  guest CPU write to such a page was kept as a cached write without clearing the mark, so the next
+  flush copied the stale host bytes over the CPU's newer data. Yoshi's CPU-written shader code got
+  zero holes and 0xff tails, programs were rejected and draws skipped: the gameplay flicker.
+- 90826d30, red/yellow ghosting: LDGSTS (asynchronous global-to-shared copy) copies when its
+  predicate holds and writes zeros otherwise. The lowering had the predicate inverted (zeros when
+  it held, the source when it did not), so the DLSS network kernel 557f7bdab63f0cb8 discarded all
+  of its valid weights and produced the same output for every pixel (blur/ghosting in the
+  red/yellow area). Same semantics as Eglantine 78743f3 and Lichii 281477e. Test:
+  ampere_async_copy (adapted from Lichii's test, GPL-3.0-or-later).
+- 87cdbfb2, black Book page: CACHE_VERSION 20 -> 21. A disk pipeline cache written by an earlier
+  integration build held the Book composition pipeline with a fragment shader that had no colour
+  output; with the persistent cache off the Book rendered. Bumping the version discards those
+  caches once.
+
+Removed in yoshi-int-build-41 (diagnostics only, no behaviour change): Book and DLSS frame
+captures, rejected-program dump, rejection/program-address/buffer-event traces, movie and frame
+traces, command trace, movie plane hashing, decoder counters, and an unused command-list hash.
+Verification: unit tests for the lowering ports pass locally (Linux, GCC 13); every touched file
+compiles with -Wall -Wextra -Wshadow; Windows CI builds the release. Not yet re-tested on this
+base: the name-entry keyboard (build 119) and long play sessions (the build 115/117/120 freezes).

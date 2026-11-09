@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "video_core/engines/fermi_2d.h"
-#include "video_core/ns2_order_trace.h"
 #include "video_core/engines/sw_blitter/blitter.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -61,21 +60,28 @@ void Fermi2D::ConsumeSinkImpl(Core::System& system) {
 }
 
 void Fermi2D::Blit() {
-    LOG_DEBUG(HW_GPU, "called. source address={:#x}, destination address={:#x}", regs.src.Address(), regs.dst.Address());
-    {
-        static std::atomic<u32> logged{};
-        const u32 count = logged.fetch_add(1, std::memory_order_relaxed);
-        VideoCommon::NS2Order::Start(40000);
-        if (VideoCommon::NS2Order::Take()) {
-            LOG_INFO(HW_GPU, "NS2 order: blit ch={} {:#x} fmt={} -> {:#x} fmt={}", VideoCommon::NS2Order::Channel(),
-                     regs.src.Address(), static_cast<u32>(regs.src.format), regs.dst.Address(),
-                     static_cast<u32>(regs.dst.format));
-        } else if (count < 200 || count % 2000 == 0) {
-            LOG_INFO(HW_GPU, "NS2 trace: 2D blit #{} {:#x} {}x{} fmt={} -> {:#x} {}x{} fmt={}", count,
-                     regs.src.Address(), regs.src.width, regs.src.height, static_cast<u32>(regs.src.format),
-                     regs.dst.Address(), regs.dst.width, regs.dst.height, static_cast<u32>(regs.dst.format));
+    if (static const u64 trace_destination = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+            return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        trace_destination != 0 && regs.dst.Address() >= trace_destination &&
+        regs.dst.Address() < trace_destination + (32ULL << 20)) {
+        static u32 traced_destination{};
+        if (traced_destination++ < 40) {
+            LOG_INFO(HW_GPU, "nx2 2D blit to traced dst: {:#x} {}x{} -> {:#x} {}x{}",
+                     regs.src.Address(), regs.src.width, regs.src.height, regs.dst.Address(),
+                     regs.dst.width, regs.dst.height);
         }
     }
+    if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
+        static u32 traced{};
+        if (traced++ < 64) {
+            LOG_INFO(HW_GPU, "nx2 2D blit {:#x} {}x{} -> {:#x} {}x{}", regs.src.Address(),
+                     regs.src.width, regs.src.height, regs.dst.Address(), regs.dst.width,
+                     regs.dst.height);
+        }
+    }
+    LOG_DEBUG(HW_GPU, "called. source address={:#x}, destination address={:#x}", regs.src.Address(), regs.dst.Address());
 
     UNIMPLEMENTED_IF_MSG(regs.operation != Operation::SrcCopy, "Operation is not copy");
     UNIMPLEMENTED_IF_MSG(regs.src.layer != 0, "Source layer is not zero");

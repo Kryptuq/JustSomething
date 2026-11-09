@@ -25,7 +25,6 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#include "common/cpu_features.h"
 #include "common/time_zone.h"
 
 #if defined(__linux__ ) && defined(ARCHITECTURE_arm64)
@@ -61,6 +60,7 @@ SWITCHABLE(NvdecEmulation, false);
 SWITCHABLE(Region, true);
 SWITCHABLE(RendererBackend, true);
 SWITCHABLE(ScalingFilter, false);
+SWITCHABLE(FrameGenType, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
 SETTING(VSyncMode, true);
@@ -175,21 +175,6 @@ bool IsGPUFenceBehaviorBalanced() {
     return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Balanced;
 }
 
-bool IsGPUFenceDelayed() {
-    if (!IsGPUFenceBehaviorDefault()) {
-        return IsGPUFenceBehaviorBalanced() || IsGPUFenceBehaviorAccurate();
-    }
-    // Switch 2 titles poll GPU completion (NVN syncs) and give up on work that is not done
-    // yet; the in-game movie drops a video frame when the GPU has not finished reading the
-    // frame slot it wants to overwrite. With delayed fences that completion comes one or more
-    // frames late (much later during window moves), and the movie flickers. Signal at GPU
-    // command processing time unless the user explicitly chose Balanced/Accurate fences.
-    if (Common::g_wall_clock.GetGuestCNTFRQ() == Common::WallClock::Switch2CNTFRQ) {
-        return false;
-    }
-    return IsGPULevelHigh();
-}
-
 bool IsGPUFenceBehaviorAccurate() {
     return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
 }
@@ -238,6 +223,26 @@ void SetCurrentProgramID(u64 program_id) {
 
 u64 GetCurrentProgramID() {
     return current_program_id;
+}
+
+static bool current_program_is_switch2 = false;
+
+void SetCurrentProgramIsSwitch2(bool is_switch2) {
+    current_program_is_switch2 = is_switch2;
+}
+
+bool CurrentProgramIsSwitch2() {
+    return current_program_is_switch2;
+}
+
+static std::optional<AstcRecompression> astc_recompression_override;
+
+AstcRecompression GetAstcRecompression() {
+    return astc_recompression_override.value_or(values.astc_recompression.GetValue());
+}
+
+void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression) {
+    astc_recompression_override = recompression;
 }
 
 bool IsDockedMode() {

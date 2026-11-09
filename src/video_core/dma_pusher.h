@@ -7,7 +7,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
+#include <optional>
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -114,33 +116,26 @@ struct CommandList final {
 
     boost::container::small_vector<CommandListHeader, 512> command_lists;
     boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
-
-    /// Contents of command_lists as they were at submission (native channels). The words of entry
-    /// i start at captured_offsets[i]; ~0U marks an entry that was not captured.
-    std::vector<CommandHeader> captured_words;
-    std::vector<u32> captured_offsets;
-    std::vector<u64> captured_sequences; ///< NativeSubmissions::Record sequence of each entry
-    u64 captured_time_us{}; ///< Steady-clock time of the capture (NS2 diagnostics)
-
-    [[nodiscard]] std::span<const CommandHeader> Captured(size_t index) const {
-        if (index >= captured_offsets.size() || captured_offsets[index] == ~0U) {
-            return {};
-        }
-        return std::span{captured_words}.subspan(captured_offsets[index], command_lists[index].size);
-    }
+    /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
+    std::vector<u64> submit_hashes;
+    /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
+    /// executed instead of the memory, which the game may already be refilling for a later frame.
+    std::vector<CommandHeader> submitted_words;
+    std::vector<u32> submitted_offsets;
+    /// DmaPusher::suspensions when the words were copied. A list copied during a suspension, or
+    /// that waited behind one, reads memory instead: games write the commands it runs before they
+    /// release the acquire.
+    u64 snapshot_suspensions = 0;
 };
 
-/// Native command list submissions with a hash of their captured contents, to tell a list the guest
-/// reused for a later submission from one it completed in place (see DmaPusher).
-namespace NativeSubmissions {
-u64 Record(s32 channel, GPUVAddr address, std::span<const CommandHeader> words);
-/// Whether a later submission of the list at `address` captured contents with this hash.
-bool ClaimedLater(s32 channel, GPUVAddr address, u64 sequence, u64 hash);
-/// Records how a change of the list at `address` was resolved.
-void NoteOutcome(s32 channel, GPUVAddr address, bool reused);
-/// Whether changes of the list at `address` were mostly claimed by later submissions.
-bool UsuallyReused(s32 channel, GPUVAddr address);
-} // namespace NativeSubmissions
+/// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
+inline u64 HashPushbufferWords(std::span<const u32> words) {
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (const u32 word : words) {
+        hash = (hash ^ word) * 0x100000001b3ULL;
+    }
+    return hash;
+}
 
 /// @brief The DmaPusher class implements DMA submission to FIFOs, providing an area of memory that the
 /// emulated app fills with commands and tells PFIFO to process. The pushbuffers are then assembled
@@ -149,6 +144,10 @@ bool UsuallyReused(s32 channel, GPUVAddr address);
 /// details on this implementation.
 class DmaPusher final {
 public:
+    /// Counts suspensions on a semaphore acquire and the resumes after them, so it is odd while
+    /// the channel is suspended (see CommandList::snapshot_suspensions).
+    std::atomic<u64> suspensions{0};
+
     explicit DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_);
     ~DmaPusher();
 
@@ -157,8 +156,14 @@ public:
     }
 
     void DispatchCalls();
-    [[nodiscard]] bool HasPendingNativeAcquire() const { return puller.HasPendingNativeAcquire(); }
-    [[nodiscard]] bool CanResumeNativeAcquire() { return !HasFailedNativeWork() && puller.CanResumeNativeAcquire(*this); }
+
+    /// Switch 2: true while the channel is suspended on a semaphore acquire.
+    [[nodiscard]] bool HasPendingAcquire() const {
+        return puller.HasPendingAcquire();
+    }
+    [[nodiscard]] bool CanResumeAcquire() {
+        return puller.CanResumeAcquire(*this);
+    }
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -170,24 +175,37 @@ public:
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
-    bool HasFailedNativeWork() const;
     bool Step();
+    /// Returns how many words were processed: fewer than given when a semaphore acquire
+    /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
-    bool UseCapturedCommands(GPUVAddr address, std::span<const CommandHeader> captured, u64 sequence);
-    size_t command_resume_offset{};
-    bool resume_from_capture{};
-    u64 reused_lists{};
-    u32 last_list_source{}; ///< NS2CommandTrace::ListSource of the last UseCapturedCommands
-    GPUVAddr trace_inline_source{}; ///< Address of the current immediate-mode header (NS2 trace)
-    u64 completed_lists{};
-    u64 waited_lists{};
-    Common::ScratchBuffer<CommandHeader> live_headers;
+    size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
 
     void CallMethod(u32 argument);
-    bool DownloadHostGpuWrittenList(GPUVAddr address, u32 words, std::span<const CommandHeader> captured);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
+    [[nodiscard]] bool WantsSegment() const;
+    void ReportUnboundSubchannel();
+    void WatchArgument(u32 method, u32 argument) const;
+
+public:
+    /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
+    /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
+    void DumpCurrentEntry(const char* reason);
+    void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
+    void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    /// Whether the entry lies on device pages the GPU has written (NX2).
+    bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
+    /// buffer cache made after the work that wrote them or from guest memory for pages flushed
+    /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
+    /// flushes and reads guest memory.
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
+    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+
+private:
 
 public:
     Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once
@@ -211,6 +229,31 @@ public:
     Control::ChannelState& channel_state;
 
     DmaState dma_state{};
+
+    // Switch 2: methods whose data continues in a later GPFIFO entry, set aside while other
+    // command buffers run (NVN interleaves several, so more than one can be pending).
+    struct ParkedMethod {
+        u32 method;
+        u32 subchannel;
+        u32 method_count;
+        bool non_incrementing;
+        bool increment_once;
+        GPUVAddr resume_address; ///< Where the entry that continues the method starts
+    };
+    void ResolveSplitMethod(GPUVAddr entry_address);
+    static constexpr size_t MaxParkedMethods = 16;
+
+    // Debug aid: hashes of the words of the last entries as they were parsed.
+    struct ParsedEntry {
+        GPUVAddr address;
+        u32 size;
+        u64 hash;
+    };
+    std::array<ParsedEntry, 64> parsed_entries{};
+    size_t parsed_entry_count{};
+    std::vector<ParkedMethod> parked_methods;
+    GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
 

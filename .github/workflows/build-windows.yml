@@ -76,10 +76,11 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          # Qt is linked statically, so eden.exe is self-contained apart from the
+          # Qt is linked statically, so eglantine.exe is self-contained apart from the
           # Visual C++ runtime (installed on most PCs; same as other Eden builds).
+          # Since build 124 main is Eglantine-based, whose executable is eglantine.exe.
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item build/bin/eden.exe release/
+          Copy-Item build/bin/eglantine.exe release/
           Get-ChildItem release | Select-Object Name, Length
 
       - name: Upload
@@ -102,8 +103,8 @@ jobs:
           prerelease: true
           files: eden-ns2-windows-x64.zip
           body: |
-            Windows x64 build of Eden with the experimental NS2 (Switch 2) patch, built from ${{ github.sha }}.
+            Windows x64 build of EdenNS2: Eglantine (Djihads80/Eglantine nx2) with the EdenNS2 Yoshi fixes, built from ${{ github.sha }}. Builds 1-123 were based on Eden master (tag edenns2-classic).
 
-            Unzip and run `eden.exe` (single file, Qt built in). If Windows reports a missing MSVCP140/VCRUNTIME140 DLL, install the Microsoft Visual C++ Redistributable (x64).
-            Optional portable mode: create an empty `user` folder next to `eden.exe` to keep settings, keys and logs there instead of %APPDATA%\eden.
+            Unzip and run `eglantine.exe` (single file, Qt built in). If Windows reports a missing MSVCP140/VCRUNTIME140 DLL, install the Microsoft Visual C++ Redistributable (x64).
+            Optional portable mode: create an empty `user` folder next to `eglantine.exe` to keep settings, keys and logs there instead of %APPDATA%\eden.
             Experimental: Switch 2 titles will most likely not run, and regular Switch games may behave differently than in stock Eden.

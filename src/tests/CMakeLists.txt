@@ -9,27 +9,36 @@ add_executable(tests
     common/cityhash.cpp
     common/container_hash.cpp
     common/fibers.cpp
+    common/game_presets.cpp
     common/host_memory.cpp
     common/param_package.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
+    common/slot_vector.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
+    common/zstd_compression.cpp
     core/core_timing.cpp
-    core/library_applet_id.cpp
-    core/program_metadata.cpp
-    core/native_gpu_characteristics.cpp
-    core/graphics_supervisor.cpp
+    core/ldn.cpp
+    core/internal_network/socket_proxy.cpp
+    core/nup_writer.cpp
+    core/priority_queue.cpp
     core/internal_network/network.cpp
-    video_core/native_semaphore.cpp
-    video_core/native_submissions.cpp
-    video_core/native_shader.cpp
-    video_core/ns2_pipeline_cache_spirv.cpp
-    video_core/native_swizzle.cpp
-    video_core/image_overlap.cpp
-    video_core/pending_download.cpp
     video_core/memory_tracker.cpp
+    video_core/vertex_repack.cpp
+    video_core/ampere_returns.cpp
+    video_core/ampere_capture.cpp
+    video_core/ampere_async_copy.cpp
+    video_core/ampere_ldsm.cpp
+    video_core/ampere_ports.cpp
+    video_core/ampere_register_remap.cpp
+    video_core/ampere_uniform_carry.cpp
+    video_core/ns2_raw_surface.cpp
+    video_core/native_macro_fifo.cpp
+    video_core/uniform_stream_reuse.cpp
+    video_core/shader_invalidation.cpp
+    video_core/descriptor_table.cpp
     input_common/calibration_configuration_job.cpp
 )
 

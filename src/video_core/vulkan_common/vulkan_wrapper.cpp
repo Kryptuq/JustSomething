@@ -5,16 +5,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/logging.h"
-#include "common/thread.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -119,6 +116,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdDrawIndirectCount);
     X(vkCmdDrawIndexedIndirectCount);
     X(vkCmdDrawIndirectByteCountEXT);
+    X(vkCmdDrawMeshTasksEXT);
     X(vkCmdEndConditionalRenderingEXT);
     X(vkCmdEndQuery);
     X(vkCmdEndRenderPass);
@@ -169,9 +167,6 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetColorBlendEnableEXT);
     X(vkCmdSetColorBlendEquationEXT);
     X(vkCmdResetQueryPool);
-    X(vkCmdWriteTimestamp);
-    X(vkGetDeviceFaultInfoEXT);
-    X(vkGetImageViewAddressNVX);
     X(vkCmdResolveImage);
     X(vkCreateBuffer);
     X(vkCreateBufferView);
@@ -225,6 +220,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetEventStatus);
     X(vkGetFenceStatus);
     X(vkGetImageMemoryRequirements);
+    X(vkGetImageSparseMemoryRequirements);
     X(vkGetPipelineCacheData);
     X(vkGetMemoryFdKHR);
 #ifdef _WIN32
@@ -335,37 +331,6 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
            X(vkGetPhysicalDeviceMemoryProperties) && X(vkGetPhysicalDeviceMemoryProperties2) &&
            X(vkGetPhysicalDeviceProperties) && X(vkGetPhysicalDeviceQueueFamilyProperties);
 #undef X
-}
-
-namespace {
-std::mutex g_device_lost_mutex;
-std::function<void()> g_device_lost_handler;
-bool g_device_lost_handled = false;
-} // Anonymous namespace
-
-void SetDeviceLostHandler(std::function<void()> handler) {
-    std::scoped_lock lock{g_device_lost_mutex};
-    g_device_lost_handler = std::move(handler);
-}
-
-void Exception::LogCreation() const {
-    static std::atomic<u32> logged{0};
-    if (logged.fetch_add(1) < 64) {
-        LOG_CRITICAL(Render_Vulkan, "NS2: Vulkan error {} ({}) raised as an exception in thread '{}'",
-                     static_cast<int>(result), string_VkResult(result), Common::GetCurrentThreadName());
-    }
-    if (result == VK_ERROR_DEVICE_LOST) {
-        // Held while the handler runs, so a second thread losing the device at the same moment
-        // cannot end the process before the report is written.
-        std::scoped_lock lock{g_device_lost_mutex};
-        if (!g_device_lost_handled && g_device_lost_handler) {
-            g_device_lost_handled = true;
-            try {
-                g_device_lost_handler();
-            } catch (...) {
-            }
-        }
-    }
 }
 
 const char* Exception::what() const noexcept {
@@ -559,6 +524,19 @@ void Image::Release() const noexcept {
     if (handle) {
         vmaDestroyImage(allocator, handle, allocation);
     }
+}
+
+Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
+    if (allocation == nullptr) {
+        return {};
+    }
+    VmaAllocationInfo2 info{};
+    vmaGetAllocationInfo2(allocator, allocation, &info);
+    if (info.dedicatedMemory) {
+        return {0, info.blockSize, info.allocationInfo.size};
+    }
+    return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
+            info.allocationInfo.size};
 }
 
 void Buffer::Flush() const {
@@ -900,6 +878,16 @@ VkMemoryRequirements Device::GetBufferMemoryRequirements(VkBuffer buffer,
 VkMemoryRequirements Device::GetImageMemoryRequirements(VkImage image) const noexcept {
     VkMemoryRequirements requirements;
     dld->vkGetImageMemoryRequirements(handle, image, &requirements);
+    return requirements;
+}
+
+std::vector<VkSparseImageMemoryRequirements> Device::GetImageSparseMemoryRequirements(
+    VkImage image) const {
+    u32 count = 0;
+    dld->vkGetImageSparseMemoryRequirements(handle, image, &count, nullptr);
+    std::vector<VkSparseImageMemoryRequirements> requirements(count);
+    dld->vkGetImageSparseMemoryRequirements(handle, image, &count, requirements.data());
+    requirements.resize(count);
     return requirements;
 }
 

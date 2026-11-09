@@ -9,7 +9,6 @@
 #include <array>
 #include <exception>
 #include <limits>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -120,9 +119,7 @@ class Exception final : public std::exception {
 public:
     /// Construct the exception with a result.
     /// @pre result != VK_SUCCESS
-    explicit Exception(VkResult result_) : result{result_} {
-        LogCreation();
-    }
+    explicit Exception(VkResult result_) : result{result_} {}
     virtual ~Exception() = default;
 
     const char* what() const noexcept override;
@@ -131,17 +128,8 @@ public:
     }
 
 private:
-    /// NS2 diagnostics: logs every Vulkan error raised as an exception (code and thread), since
-    /// one that is not caught ends the process without a trace.
-    void LogCreation() const;
-
     VkResult result;
 };
-
-/// NS2 diagnostics: called once, on the first VK_ERROR_DEVICE_LOST raised as an exception, before
-/// the exception propagates (the driver's fault report is only available after the loss). Other
-/// threads raising it at the same time wait until the handler returned. Empty to remove.
-void SetDeviceLostHandler(std::function<void()> handler);
 
 /// Throws a Vulkan exception if result is not success.
 inline void Check(VkResult result) {
@@ -244,6 +232,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdDrawIndirectCount vkCmdDrawIndirectCount{};
     PFN_vkCmdDrawIndexedIndirectCount vkCmdDrawIndexedIndirectCount{};
     PFN_vkCmdDrawIndirectByteCountEXT vkCmdDrawIndirectByteCountEXT{};
+    PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT{};
     PFN_vkCmdEndConditionalRenderingEXT vkCmdEndConditionalRenderingEXT{};
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
@@ -255,9 +244,6 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPushConstants vkCmdPushConstants{};
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
-    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
-    PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT{};
-    PFN_vkGetImageViewAddressNVX vkGetImageViewAddressNVX{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
@@ -350,6 +336,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetEventStatus vkGetEventStatus{};
     PFN_vkGetFenceStatus vkGetFenceStatus{};
     PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements{};
+    PFN_vkGetImageSparseMemoryRequirements vkGetImageSparseMemoryRequirements{};
     PFN_vkGetPipelineCacheData vkGetPipelineCacheData{};
     PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR{};
 #ifdef _WIN32
@@ -704,6 +691,11 @@ public:
           allocation{allocation_}, dld{&dld_} {}
     Image() = default;
 
+    /// True for an image created without memory (an unbacked sparse image).
+    bool IsUnbacked() const noexcept {
+        return handle != VK_NULL_HANDLE && allocation == VK_NULL_HANDLE;
+    }
+
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 
@@ -744,6 +736,15 @@ public:
     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {
         return usage;
     }
+
+    /// Where the image's memory lies: the block (0 when the image has no memory or a block of
+    /// its own), the block's size and the image's part of it.
+    struct MemoryBlock {
+        u64 block;
+        u64 block_size;
+        u64 size;
+    };
+    [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
 
 private:
     void Release() const noexcept;
@@ -1121,6 +1122,9 @@ public:
 
     VkMemoryRequirements GetImageMemoryRequirements(VkImage image) const noexcept;
 
+    std::vector<VkSparseImageMemoryRequirements> GetImageSparseMemoryRequirements(
+        VkImage image) const;
+
     std::vector<VkPipelineExecutablePropertiesKHR> GetPipelineExecutablePropertiesKHR(
         VkPipeline pipeline) const;
 
@@ -1175,22 +1179,6 @@ public:
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
         dld->vkResetQueryPool(handle, query_pool, first, count);
-    }
-
-    /// VK_NVX_image_view_handle; returns VK_ERROR_EXTENSION_NOT_PRESENT when it was not loaded.
-    VkResult GetImageViewAddress(VkImageView view, VkImageViewAddressPropertiesNVX& properties) const noexcept {
-        if (!dld->vkGetImageViewAddressNVX) {
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
-        }
-        return dld->vkGetImageViewAddressNVX(handle, view, &properties);
-    }
-
-    /// VK_EXT_device_fault; returns VK_ERROR_EXTENSION_NOT_PRESENT when it was not loaded.
-    VkResult GetFaultInfo(VkDeviceFaultCountsEXT* counts, VkDeviceFaultInfoEXT* info) const noexcept {
-        if (!dld->vkGetDeviceFaultInfoEXT) {
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
-        }
-        return dld->vkGetDeviceFaultInfoEXT(handle, counts, info);
     }
 
     VkResult GetQueryResults(VkQueryPool query_pool, u32 first, u32 count, std::size_t data_size,
@@ -1290,10 +1278,6 @@ public:
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
     }
 
-    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool, u32 query) const noexcept {
-        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
-    }
-
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,
                             Span<VkDescriptorSet> sets, Span<u32> dynamic_offsets) const noexcept {
         dld->vkCmdBindDescriptorSets(handle, bind_point, layout, first, sets.size(), sets.data(),
@@ -1343,6 +1327,10 @@ public:
     void DrawIndexedIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
                              u32 stride) const noexcept {
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
+    }
+
+    void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {
+        dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
     }
 
     void DrawIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset, VkBuffer count_buffer,
