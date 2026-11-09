@@ -103,7 +103,10 @@ public:
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     std::string NS2DescribeGpuRange(DAddr addr, u64 size) override;
 
-    /// NS2 Book capture (diagnostics): saves the images the capture frame wrote, closes the log.
+    /// NS2 Book capture (diagnostics): opens the log at the start of the capture frame.
+    void NS2BookCaptureStart();
+
+    /// NS2 Book capture (diagnostics): writes the summary and closes the log.
     void NS2BookCaptureFinish();
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
@@ -156,6 +159,8 @@ public:
                                                             u32 pixel_stride);
 
 private:
+    /// NS2 Book capture: captures a page composition draw in full (returns false for other draws).
+    bool NS2BookCompositionBefore(const GraphicsPipeline& pipeline, bool is_indexed);
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU
         0x0100E95004038000ULL, // XC2

@@ -3,21 +3,23 @@
 
 #pragma once
 
-// Diagnostics only (yoshi-int-build-36): one-frame capture for Yoshi's near-black Book page.
-// Eden's screenshot command arms it; the frame rendered after the screenshot frame is captured,
-// once per session. For every draw and compute dispatch of that frame the texture cache writes
-// the render targets, the texture descriptors (raw TIC words as read from game memory) and the
-// image each one resolved to; every distinct image is saved once, before its first use, both as
-// the host GPU copy (.ns2img) and as the raw bytes in game memory (.guest); images written by the
-// frame (render targets, storage images, blit/copy destinations) are saved again at its end.
-// Skipped draws, uploads from game memory and blits are logged too. Nothing changes rendering;
-// saving waits for the host GPU, so that one frame is slow.
-// Files: <log dir>/ns2_book_capture_yoshi-integration/ (capture.txt + images).
+// Diagnostics only: one-frame capture for Yoshi's near-black Book page.
+// Eden's screenshot command arms it; the frame rendered after the screenshot frame is captured
+// (each screenshot captures again, into capture1, capture2, ...). capture.txt lists every draw and
+// dispatch of that frame with its render targets, texture descriptors (raw TIC words) and resolved
+// images (text only; yoshi-int-build-36 also saved every image, which exhausted its budget).
+// yoshi-int-build-37: the Book page composition draws (fragment programs 60c4a9ac1580d2bf and
+// 0c82e37b9766ef61, plus up to 16 draws before the frame's first dispatch) are captured in full
+// in composition/: the Maxwell register file, the host pipeline key, constant buffers, vertex and
+// index data, native and lowered programs, and the render targets before the first and after
+// every such draw. Nothing changes rendering; saving waits for the host GPU (that frame is slow).
+// Files: <log dir>/ns2_book_capture_yoshi-integration/captureN/.
 
 #include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -37,10 +39,21 @@ inline bool Active() {
     return State().load(std::memory_order_relaxed) == Capturing;
 }
 
-/// The screenshot command was used: capture the next frame (first time per session only).
+inline std::atomic<u32>& CaptureNumber() {
+    static std::atomic<u32> number{0};
+    return number;
+}
+
+/// The screenshot command was used: capture the next frame (again after a finished capture).
 inline void Arm() {
     u32 expected = Idle;
-    State().compare_exchange_strong(expected, Armed);
+    if (!State().compare_exchange_strong(expected, Armed)) {
+        expected = Done;
+        if (!State().compare_exchange_strong(expected, Armed)) {
+            return;
+        }
+    }
+    CaptureNumber().fetch_add(1, std::memory_order_relaxed);
 }
 
 /// Called once per presented frame. Returns 1 when the capture frame starts, 2 when it ends.
@@ -57,12 +70,38 @@ inline int OnFramePresented() {
 }
 
 inline std::filesystem::path Directory() {
-    return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_book_capture_yoshi-integration";
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "ns2_book_capture_yoshi-integration" /
+           ("capture" + std::to_string(CaptureNumber().load(std::memory_order_relaxed)));
 }
 
-/// Budget for saved image data (the user uploads the folder).
-constexpr u64 MaxImageBytes = 48ULL << 20;
-constexpr u64 MaxTotalBytes = 768ULL << 20;
+inline std::filesystem::path CompositionDirectory() {
+    return Directory() / "composition";
+}
+
+/// Budget for saved image data (the user uploads the folder). Only composition render targets are
+/// saved: at most 17 captures of a 1920x1080 RGBA8 target (~140 MiB), far below the budget.
+constexpr u64 MaxImageBytes = 64ULL << 20;
+constexpr u64 MaxTotalBytes = 512ULL << 20;
+
+/// Fragment programs of the Book page composition (yoshi-int-build-36 capture): the illustration,
+/// paper and icon draws, and the text draws.
+constexpr u64 CompositionFragmentHashes[] = {0x60c4a9ac1580d2bfULL, 0x0c82e37b9766ef61ULL};
+/// Draws before the frame's first dispatch also captured in full (the composition runs there).
+constexpr u32 MaxEarlyDraws = 16;
+
+struct Composition {
+    bool dispatch_seen = false;
+    u32 early_draws = 0;
+    u32 hash_draws = 0;
+    u32 index = 0;
+    u64 last_rt0 = 0;
+    std::set<u64> programs;
+};
+
+inline Composition& GetComposition() {
+    static Composition composition;
+    return composition;
+}
 
 struct Log {
     std::mutex mutex;
@@ -80,8 +119,10 @@ inline void Open() {
     std::scoped_lock lock{log.mutex};
     std::error_code ec;
     std::filesystem::create_directories(Directory(), ec);
+    std::filesystem::create_directories(CompositionDirectory(), ec);
     log.file.open(Directory() / "capture.txt", std::ios::trunc);
     log.event = 0;
+    GetComposition() = Composition{};
 }
 
 inline void Line(std::string_view text) {

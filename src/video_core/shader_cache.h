@@ -77,6 +77,12 @@ public:
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
 
+    /// NS2 diagnostics (Book composition capture): the program of graphics stage `index` of the
+    /// pipeline looked up last (valid right after CurrentGraphicsPipeline()).
+    [[nodiscard]] const ShaderInfo* NS2CurrentShaderInfo(size_t index) const noexcept {
+        return shader_infos[index];
+    }
+
 protected:
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;

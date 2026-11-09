@@ -322,6 +322,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         report_failure("configure failed");
         return;
     }
+    // NS2 Book capture (diagnostics): the page composition draws are captured in full.
+    const bool ns2_composition =
+        VideoCommon::NS2BookCapture::Active() && NS2BookCompositionBefore(*pipeline, is_indexed);
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
@@ -336,6 +339,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         draw_func();
     }
     submitted = true;
+    if (ns2_composition) [[unlikely]] {
+        texture_cache.NS2BookSaveRenderTargets(
+            fmt::format("draw{:02}_after", VideoCommon::NS2BookCapture::GetComposition().index - 1));
+    }
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
         native_capture_count < 16 && [] {
@@ -2491,6 +2498,114 @@ void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
 void RasterizerVulkan::NS2BookCaptureFinish() {
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.NS2BookCaptureFinish();
+}
+
+void RasterizerVulkan::NS2BookCaptureStart() {
+    std::scoped_lock lock{texture_cache.mutex};
+    texture_cache.NS2BookCaptureStart();
+}
+
+bool RasterizerVulkan::NS2BookCompositionBefore(const GraphicsPipeline& pipeline, bool is_indexed) {
+    namespace Capture = VideoCommon::NS2BookCapture;
+    Capture::Composition& composition = Capture::GetComposition();
+    const auto& key = pipeline.NS2Key();
+    const u64 fragment = key.unique_hashes[5];
+    const bool by_hash = std::ranges::find(Capture::CompositionFragmentHashes, fragment) !=
+                         std::end(Capture::CompositionFragmentHashes);
+    const bool early = !composition.dispatch_seen && composition.early_draws < Capture::MaxEarlyDraws;
+    if (!by_hash && !early) {
+        return false;
+    }
+    composition.hash_draws += by_hash ? 1 : 0;
+    composition.early_draws += early ? 1 : 0;
+    const u32 index = composition.index++;
+    const auto& regs = maxwell3d->regs;
+    const auto dir = Capture::CompositionDirectory();
+    const std::string prefix = fmt::format("draw{:02}", index);
+    std::vector<std::string> files;
+    const auto write = [&](const std::string& name, const void* data, size_t size) {
+        std::ofstream file(dir / name, std::ios::binary);
+        file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+        files.push_back(fmt::format("{}{}", name, file ? "" : "(WRITE FAILED)"));
+    };
+    const auto write_gpu = [&](const std::string& name, GPUVAddr address, u64 size) {
+        if (address == 0 || size == 0 || !gpu_memory->IsFullyMappedRange(address, size)) {
+            files.push_back(fmt::format("{}(unmapped {:#x}+{:#x})", name, address, size));
+            return;
+        }
+        std::vector<u8> data(size);
+        gpu_memory->ReadBlockUnsafe(address, data.data(), data.size());
+        write(name, data.data(), data.size());
+    };
+    // Complete Maxwell register file (blend, colour masks, scissor, viewport, raster, depth/stencil,
+    // alpha test, vertex/index state, program addresses) and the host pipeline key it produced.
+    write(prefix + "_regs.bin", regs.reg_array.data(), sizeof(regs.reg_array));
+    write(prefix + "_key.bin", &key, key.Size());
+    // Programs: native bytes (from the stage's native address) and the lowered code, once each.
+    std::string programs;
+    for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage) {
+        const u64 hash = key.unique_hashes[stage];
+        const VideoCommon::ShaderInfo* const info = pipeline_cache.NS2CurrentShaderInfo(stage);
+        const GPUVAddr native =
+            (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
+        if (hash == 0) {
+            continue;
+        }
+        const auto* lowered = info ? info->lowered_native.get() : nullptr;
+        programs += fmt::format(" stage{}={:016x}@{:#x}(native key {:016x})", stage, hash, native,
+                                lowered ? lowered->native_key : 0);
+        if (!composition.programs.insert(hash).second) {
+            continue;
+        }
+        if (lowered) {
+            write(fmt::format("program_{:016x}_lowered.bin", hash), lowered->code.data(),
+                  lowered->code.size() * sizeof(u64));
+            write_gpu(fmt::format("program_{:016x}_native.bin", hash), native, lowered->source_size);
+        } else {
+            files.push_back(fmt::format("program_{:016x}(not native)", hash));
+        }
+    }
+    // Constant buffers of the vertex and fragment stages.
+    for (const size_t stage : {size_t{0}, size_t{4}}) {
+        const auto& buffers = maxwell3d->state.shader_stages[stage].const_buffers;
+        for (size_t slot = 0; slot < buffers.size(); ++slot) {
+            if (buffers[slot].enabled && buffers[slot].size != 0) {
+                write_gpu(fmt::format("{}_stage{}_cb{}.bin", prefix, stage, slot), buffers[slot].address,
+                          (std::min<u64>)(buffers[slot].size, 0x1000));
+            }
+        }
+    }
+    // Vertex streams and the index buffer.
+    for (size_t stream = 0; stream < regs.vertex_streams.size(); ++stream) {
+        const auto& vertex_stream = regs.vertex_streams[stream];
+        if (!vertex_stream.IsEnabled()) {
+            continue;
+        }
+        const GPUVAddr start = vertex_stream.Address();
+        const GPUVAddr limit = regs.vertex_stream_limits[stream].Address();
+        const u64 size = limit >= start ? (std::min<u64>)(limit - start + 1, 0x4000) : 0x1000;
+        write_gpu(fmt::format("{}_vb{}.bin", prefix, stream), start, size);
+    }
+    if (is_indexed) {
+        const GPUVAddr start = regs.index_buffer.StartAddress();
+        const GPUVAddr end = regs.index_buffer.EndAddress();
+        write_gpu(prefix + "_ib.bin", start, end > start ? (std::min<u64>)(end - start, 0x4000) : 0);
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    Capture::Line(fmt::format(
+        "#{} COMPOSITION {} ({}{}) topology={} indexed={} vertices first={} count={} indices first={} count={} "
+        "base_instance={} rt0={:#x} {}x{}{}\n    files: {}",
+        Capture::NextEvent(), prefix, by_hash ? "fragment program" : "", early ? (by_hash ? ", early" : "early") : "",
+        static_cast<u32>(draw_state.topology), is_indexed, draw_state.vertex_buffer.first,
+        draw_state.vertex_buffer.count, draw_state.index_buffer.first, draw_state.index_buffer.count,
+        draw_state.base_instance, regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height, programs,
+        fmt::join(files, " ")));
+    // The render targets before the first captured draw into each colour target 0.
+    if (regs.rt[0].Address() != composition.last_rt0) {
+        composition.last_rt0 = regs.rt[0].Address();
+        texture_cache.NS2BookSaveRenderTargets(prefix + "_before");
+    }
+    return true;
 }
 
 } // namespace Vulkan

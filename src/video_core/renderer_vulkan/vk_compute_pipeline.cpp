@@ -432,6 +432,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         texture_cache.NS2BookCaptureViews(
             fmt::format("compute native={:016x} pipeline={:016x}", ns2_native_key, shader_hash),
             std::span<const VideoCommon::ImageViewInOut>(views.data(), views.size()), true);
+        VideoCommon::NS2BookCapture::GetComposition().dispatch_seen = true;
     }
 
     // NS2 diagnostics (port of EdenNS2 main's b102/b103 resource log, same format): the resources

@@ -139,6 +139,11 @@ public:
         transitions.clear();
     }
 
+    /// NS2 diagnostics (Book composition capture): the cache key (stage hashes + fixed state).
+    [[nodiscard]] const GraphicsPipelineCacheKey& NS2Key() const noexcept {
+        return key;
+    }
+
     [[nodiscard]] bool IsBuilt() const noexcept {
         return is_built.load(std::memory_order::relaxed);
     }
