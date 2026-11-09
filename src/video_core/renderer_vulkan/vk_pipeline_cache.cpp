@@ -67,7 +67,10 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 20;
+// 21: discards disk caches written by earlier yoshi-integration builds. One held Yoshi's Book page
+// composition pipeline with a fragment shader that had no colour output (the page image stayed
+// black; with the persistent pipeline cache off it renders).
+constexpr u32 CACHE_VERSION = 21;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
