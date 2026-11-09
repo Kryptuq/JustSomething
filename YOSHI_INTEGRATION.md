@@ -475,3 +475,14 @@ first difference is at the first LDGSTS.
   session: each draw/dispatch, its render targets, texture descriptors (raw TIC words) and the
   images they resolved to, saved as host copy (.ns2img) and game-memory bytes (.guest), plus the
   images the frame wrote, skipped draws, uploads and blits. <log dir>/ns2_book_capture_yoshi-integration/.
+
+## yoshi-int-build-37: Book composition capture (diagnostics)
+yoshi-int-build-36 results (user): flicker still fixed, red/yellow ghosting gone, 55-60 FPS (dips
+to ~45), Book page image still black. Offline: 557f matches hardware semantics, every network stage
+is finite, the history weight recovered (0.02 -> 0.165). The Book capture narrowed the loss to the
+page composition at the start of the frame: the illustration/paper draws (fragment program
+60c4a9ac1580d2bf) leave nothing in the page target while the text draws do.
+- Diagnostics: the composition draws are captured in full (registers, pipeline key, constant
+  buffers, vertex/index data, native and lowered programs, render targets before/after each draw)
+  to <log dir>/ns2_book_capture_yoshi-integration/captureN/composition/. Ctrl+P while the Book is
+  visible; every screenshot captures again.
