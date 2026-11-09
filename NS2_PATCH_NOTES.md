@@ -808,3 +808,21 @@ traces, command trace, movie plane hashing, decoder counters, and an unused comm
 Verification: unit tests for the lowering ports pass locally (Linux, GCC 13); every touched file
 compiles with -Wall -Wextra -Wshadow; Windows CI builds the release. Not yet re-tested on this
 base: the name-entry keyboard (build 119) and long play sessions (the build 115/117/120 freezes).
+
+## Branch fix/green-hat — green-hat-build-1 (Ocarina of Time test build, not a main release)
+Base: Main Build 124 (5b90b47b). Target: The Legend of Zelda: Ocarina of Time (Switch 2), 0400486024DEC000.
+Problem on Build 124: the game stopped during boot. The log shows the game reporting result
+2001-0120 (kernel "not implemented") and then a userspace panic (svcBreak) about 0.4 s after the
+graphics setup. The game waits on a 64-bit value with svcWaitForAddress arbitration type 3
+(WaitIfEqual64), which this kernel did not know: the value was truncated to 32 bits and type 3
+was rejected.
+Fix: cherry-pick of upstream Eglantine commit b6706b0c29f876d0c96a56563080fce494721337
+("kernel: Fix OOT startup by implementing WaitIfEqual64", zirulo, Eglantine PR #567), unchanged.
+It passes the full 64-bit compare value through the SVC, accepts type 3 (8-byte alignment) and
+compares the 64-bit user value in KAddressArbiter::WaitIfEqual. Types 0-2 behave as before.
+No other upstream change was needed: 6 of the 8 touched files are identical to the commit's parent,
+the other 2 differ only in unrelated lines. Nothing else changed (no GPU/shader/Yoshi code touched).
+CI: new workflow "Build Windows (Ocarina fix/green-hat)" (push to fix/green-hat ->
+release green-hat-build-N); main's workflow and numbering are unchanged.
+Verification: the touched kernel files compile with -Wall -Wextra -Wshadow (Linux, GCC 13);
+Windows CI builds the release. Runtime: to be tested by the user.
