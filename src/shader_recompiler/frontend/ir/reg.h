@@ -271,14 +271,17 @@ enum class Reg : u64 {
 static_assert(static_cast<int>(Reg::RZ) == 255);
 
 constexpr size_t NUM_USER_REGS = 255;
-// Registers 256 and up are not addressable by guest instructions. Native program lowering
-// redirects guest registers there (see Environment::RegisterRemaps) when the guest program
-// occupies the registers the lowering needs for its own values.
+// Native lowering keeps shadowed guest registers and borrowed scratch registers in two more banks
+// of 256 (R256-R767). Only native register copies (a MOV form Maxwell code never uses) reach them.
+// Registers 768 and up are not addressable by guest instructions either: EdenNS2's register remap
+// (the fallback where the shadow copies don't apply) redirects guest registers there (see
+// Environment::RegisterRemaps) when the guest program occupies the registers the lowering needs.
+constexpr size_t NUM_REGISTER_BANK_REGS = 768;
 constexpr size_t NUM_EXTENDED_REGS = 64;
-constexpr size_t NUM_REGS = 256 + NUM_EXTENDED_REGS;
+constexpr size_t NUM_REGS = NUM_REGISTER_BANK_REGS + NUM_EXTENDED_REGS;
 
 [[nodiscard]] constexpr Reg ExtendedReg(size_t index) noexcept {
-    return static_cast<Reg>(256 + index);
+    return static_cast<Reg>(NUM_REGISTER_BANK_REGS + index);
 }
 
 /// Guest register `from` refers to extended register `to` (for one translated instruction).
@@ -336,7 +339,8 @@ struct fmt::formatter<Shader::IR::Reg> {
     auto format(const Shader::IR::Reg& reg, FormatContext& ctx) const {
         if (reg == Shader::IR::Reg::RZ) {
             return fmt::format_to(ctx.out(), "RZ");
-        } else if (static_cast<int>(reg) >= 0 && static_cast<int>(reg) < 255) {
+        } else if (static_cast<int>(reg) >= 0 &&
+                   static_cast<int>(reg) < static_cast<int>(Shader::IR::NUM_REGS)) {
             return fmt::format_to(ctx.out(), "R{}", static_cast<int>(reg));
         } else if (static_cast<size_t>(reg) >= 256 && static_cast<size_t>(reg) < Shader::IR::NUM_REGS) {
             return fmt::format_to(ctx.out(), "X{}", static_cast<int>(reg) - 256);

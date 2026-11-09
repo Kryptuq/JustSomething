@@ -521,3 +521,42 @@ This build removes the temporary diagnostics; no rendering, shader or timing log
   byte-for-byte unchanged, so the disk caches written by build 40 stay valid.
 - No environment variable or setting is needed. Optional overrides that remain:
   EDEN_NS2_SNAPSHOT_RULE, EDEN_NX2_SEMAPHORE_MIRROR, EDEN_NX2_BUFFER_DOWNLOADS.
+
+## yoshi-int-build-42: upstream sync (Eglantine nx2 78743f30c)
+Merge of Djihads80/Eglantine `nx2` at 78743f30c (2026-11-08, tag v0.1.0-rc3; mirrored as
+`eglantine-upstream`) into this branch: 476 upstream commits since the previous base 7adcecc6d,
+among them ~60 for Ocarina of Time (0400486024DEC000). Rollback point: yoshi-int-build-41
+(10dc5161, the same tree as Main Build 124 apart from the notes and the main workflow). No Lichii
+changes, no diagnostics.
+Conflicts (9 files) and how they were resolved:
+- frontend/ampere/lower_to_maxwell.h (28 hunks). Rule: upstream's lowering first; where upstream
+  rejects a form that EdenNS2/this branch lowered for Yoshi, this branch's lowering runs instead
+  (`lower_yoshi_form`: SUST.P 1D buffer / other memory orders, TLD.SCR uniform handle, LDGSTS,
+  LDGDEPBAR, geometry epilogue/OUT, I2F of an immediate; `lower_surface_atomic` for SUATOM/SURED;
+  `lower_lea` for the general LEA). Kept from this branch: HMMA -> NS2_HMMA for Yoshi
+  (NativeTensorByDefault, before upstream's tensor/compact choice), UIADD3 uniform carries (and their
+  rejection under a uniform guard), guarded uniform ALU ops, F2I F16 roundings, I2F 8/16/32-bit
+  forms, SHF immediate funnel shifts, TLD4.B register handle. Taken from upstream: register
+  pressure through shadow copies in IR register banks 1/2, with this branch's register remap as the
+  fallback for forms the shadow copies don't know (extended registers moved to R768+); LDSM uniform
+  offset; ULDC byte/half widths; .U branches as plain branches; NOINC call capture; USHF 0x499.
+- program_capture.h: upstream's version (its NOINC handling passes this branch's capture tests).
+- ir/reg.h: banks R0-R767 (upstream) plus 64 extended registers for the remap.
+- texture_pass.cpp: upstream's rect-sample patch and this branch's raw-surface split.
+- dma_pusher.cpp: the Yoshi snapshot rule (ae88b679) with upstream's deferred entries and
+  GPU-written check.
+- shader_environment.cpp: both (remap log; upstream's reject-by-hash and debug hooks); geometry
+  programs as upstream (EDEN_NX2_EXPERIMENTAL_GEOMETRY, on by default).
+- vk_pipeline_cache.cpp: CACHE_VERSION 32 (upstream 31, this branch 21), and
+  MIN_COMPATIBLE_CACHE_VERSION 21 (upstream 20) with a static_assert: caches below 21 (the stale Book
+  pipeline) are still deleted; 21-31 are re-translated at boot.
+- tests: both lists; shader_invalidation keeps this branch's rejection helper.
+Also changed: shader_cache.cpp untracks the pages of forgotten rejections when the debug server
+clears them (upstream cleared the map only); format_lookup_table.cpp is upstream's (it now has the
+same G8R24 mapping); ampere_capture.cpp expects .U branches to lower; ampere_register_remap.cpp runs
+bank copies and tests the remap fallback.
+Unchanged: c6e552ef (fence downloads for Switch 2 titles), 90826d30 (LDGSTS predicate), the
+semaphore mirror stays off (7307537a). Note: c6e552ef downloads every GPU write at fences for all
+Switch 2 titles. Upstream measured ~5 GB/s of fence downloads in Ocarina's forest when only the
+buffers with a CPU-read page were downloaded whole (5d742e369); downloading every GPU write may cost
+more, so Ocarina may run slower here than on upstream (to be measured, not changed in this build).
