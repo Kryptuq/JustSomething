@@ -503,3 +503,21 @@ cached pipeline and compiled from game memory is correct. The user confirmed: wi
 pipeline cache" off the Book renders.
 - Fix: CACHE_VERSION 20 -> 21, so existing caches are discarded and rebuilt once (first run stutters
   while shaders compile again). No rendering logic changed.
+
+## yoshi-int-build-41: diagnostics removed (release candidate for Main Build 124)
+yoshi-int-build-40 results (user): the Book renders with the persistent pipeline cache on, no
+gameplay flicker, no red/yellow ghosting, ~55-60 FPS; the Yoshi result matches main build-123.
+This build removes the temporary diagnostics; no rendering, shader or timing logic changes:
+- Removed: Book capture (ns2_book_capture.h, runtime program recording), DLSS reconstruction and
+  network captures, rejected-program dump (log/ns2_native), rejection-lifecycle, program-address
+  and buffer-event traces, movie/frame/writer/semaphore/texture-handle traces (ns2_frame_trace.h),
+  command trace (ns2_command_trace.*), GP-entry and changed-entry logs, movie plane hashing in the
+  texture cache, decoder counters, invalid-format caller chain, null-texel-buffer warnings, and the
+  unused command-list submission bookkeeping (a hash of every submitted list).
+- Kept: every fix (lowering ports, command-list snapshot rule, semaphore mirror off, G8R24 depth,
+  null texel buffers, geometry programs, capture call rule, rejection ranges, SHFL/F2I/HMMA,
+  F2FP/SUST.B, raw-surface split, UIADD3 carry, register remap, LDSM, fence downloads c6e552ef,
+  LDGSTS 90826d30, CACHE_VERSION 21 87cdbfb2) and their unit tests. The shader lowering is
+  byte-for-byte unchanged, so the disk caches written by build 40 stay valid.
+- No environment variable or setting is needed. Optional overrides that remain:
+  EDEN_NS2_SNAPSHOT_RULE, EDEN_NX2_SEMAPHORE_MIRROR, EDEN_NX2_BUFFER_DOWNLOADS.
