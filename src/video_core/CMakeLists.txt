@@ -64,6 +64,8 @@ add_library(video_core STATIC
     framebuffer_config.h
     fsr.cpp
     fsr.h
+    game_dlss_status.cpp
+    game_dlss_status.h
     host1x/codecs/decoder.cpp
     host1x/codecs/decoder.h
     host1x/codecs/h264.cpp
@@ -79,6 +81,7 @@ add_library(video_core STATIC
     host1x/control.h
     host1x/gpu_device_memory_manager.cpp
     host1x/gpu_device_memory_manager.h
+    host1x/h264_packet.h
     host1x/host1x.cpp
     host1x/host1x.h
     host1x/nvdec.cpp
@@ -108,6 +111,9 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_debug_control.cpp
+    nx2_debug_control.h
+    nx2_diag.h
     nx2_profile.h
     present.h
     pte_kind.h
@@ -156,6 +162,7 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
     renderer_vulkan/renderer_vulkan.h
@@ -171,6 +178,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_dlss_network_probe.cpp
+    renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_descriptor_buffer.cpp
@@ -179,6 +188,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_descriptor_pool.h
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
+    renderer_vulkan/vk_frame_dump.cpp
+    renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
     renderer_vulkan/vk_multi_range_buffer.cpp
