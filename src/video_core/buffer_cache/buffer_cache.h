@@ -16,6 +16,7 @@
 
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -209,8 +210,12 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
             const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
             return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
         }();
+        // Not for Yoshi and the Mysterious Book, which keeps Main Build 124's download here
+        // (Shader::Ampere::YoshiCompatibility).
         const bool inline_writes =
-            forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+            forced >= 0 ? forced == 1
+                        : Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                              !Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed);
         if (inline_writes && IsRegionRegistered(device_addr, size)) {
             tmp_buffer.resize_destructive(size);
             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);

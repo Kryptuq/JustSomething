@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_diag.h"
@@ -602,9 +603,13 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         diag_note("ablated");
         return false;
     }
+    // Yoshi and the Mysterious Book runs its compute passes as Main Build 124 did: its own DLSS
+    // network is never followed, skipped or replaced, and a rejected matrix multiply program gets
+    // Build 124's plain upscale stand-in (Shader::Ampere::YoshiCompatibility).
+    const bool build124 = Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed);
     // Fortune's Weave's DLSS evaluation runs from its first pass to the pass that writes the
     // upscaled image. Its inputs are kept from the first pass for a replacement upscale.
-    if (RememberDlssMotionVectors()) {
+    if (!build124 && RememberDlssMotionVectors()) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
@@ -641,7 +646,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         const char* value = std::getenv("EDEN_NX2_UPSCALE_REPLACE");
         return value == nullptr || std::string_view{value} != "0";
     }();
-    if (network_replace && !dlss_chain.active &&
+    if (network_replace && !build124 && !dlss_chain.active &&
         (launch_description.const_buffer_enable_mask & 1)) {
         const auto& cbuf = launch_description.const_buffer_config[0];
         const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
@@ -791,6 +796,9 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                    std::string_view::npos) {
             DescribeNativeResources(qmd);
             // The console runs this on tensor cores; stand in with a plain upscale of its input.
+            if (build124) {
+                return UpscaleInsteadOfNativeProgram();
+            }
             if (UpscaleInsteadOfNativeProgram()) {
                 return true;
             }
@@ -798,7 +806,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             return UpscaleFromConstBuffers();
         }
     }
-    if (dispatched && !dlss_chain.active && photo_upscale.window_left != 0) {
+    if (dispatched && !build124 && !dlss_chain.active && photo_upscale.window_left != 0) {
         UpscaleFromConstBuffers();
     }
     if (output_pass) {

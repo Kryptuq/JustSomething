@@ -32,6 +32,7 @@
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/build124/program_capture.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
@@ -522,6 +523,26 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
     std::vector<Instruction> native;
     Shader::Ampere::ProgramCaptureState capture;
+    // Yoshi and the Mysterious Book keeps Main Build 124's capture and lowering (frontend/ampere/
+    // build124/): its programs lower to the same code as there, so its pipeline caches match.
+    const bool build124 = Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed);
+    Shader::Ampere::Build124::ProgramCaptureState capture124;
+    static_assert(Shader::Ampere::Build124::ProgramCaptureState::MaximumInstructions ==
+                  Shader::Ampere::ProgramCaptureState::MaximumInstructions);
+    const auto observe = [&](const Instruction& instruction, u32 index) {
+        using Result = Shader::Ampere::ProgramCaptureState::Result;
+        if (!build124) {
+            return capture.Observe(instruction, index);
+        }
+        switch (capture124.Observe(instruction, index)) {
+        case Shader::Ampere::Build124::ProgramCaptureState::Result::Complete:
+            return Result::Complete;
+        case Shader::Ampere::Build124::ProgramCaptureState::Result::InvalidTarget:
+            return Result::InvalidTarget;
+        default:
+            return Result::Continue;
+        }
+    };
     NativeInstructionReader reader{*gpu_memory};
     last_native_capture = {program_base, native_header_size};
     for (u32 index = 0; index < maximum_instructions; ++index) {
@@ -540,7 +561,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         native.push_back(instruction);
         last_native_capture.size = native_header_size + native.size() * sizeof(Instruction);
-        const auto status = capture.Observe(instruction, index);
+        const auto status = observe(instruction, index);
         if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
             if (const char* dir = std::getenv("EDEN_NX2_SHADER_DUMP")) {
                 const auto path = fmt::format("{}/rejected-{:x}.bin", dir, program_base + native_header_size);
@@ -556,11 +577,13 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(
-        native, {.geometry = geometry,
-                 .tensor = native_tensor,
-                 .compact_tensor = native_compact_tensor,
-                 .native_code_address = program_base + native_header_size});
+    auto lowered = build124
+                       ? Shader::Ampere::Build124::LowerToMaxwell(native)
+                       : Shader::Ampere::LowerToMaxwell(
+                             native, {.geometry = geometry,
+                                      .tensor = native_tensor,
+                                      .compact_tensor = native_compact_tensor,
+                                      .native_code_address = program_base + native_header_size});
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {

@@ -45,6 +45,13 @@ add_executable(tests
     video_core/ampere_gradient.cpp
     video_core/ampere_returns.cpp
     video_core/ampere_capture.cpp
+    video_core/build124_ampere_async_copy.cpp
+    video_core/build124_ampere_capture.cpp
+    video_core/build124_ampere_ldsm.cpp
+    video_core/build124_ampere_ports.cpp
+    video_core/build124_ampere_register_remap.cpp
+    video_core/build124_ampere_returns.cpp
+    video_core/build124_ampere_uniform_carry.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_ldsm.cpp
     video_core/ampere_ports.cpp

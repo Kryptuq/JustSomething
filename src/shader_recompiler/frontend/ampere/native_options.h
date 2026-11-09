@@ -16,4 +16,15 @@ inline std::atomic<bool>& NativeTensorByDefault() {
     return enabled;
 }
 
+/// Yoshi and the Mysterious Book (full version and demo; set in ChannelState::Init): its native
+/// programs are captured and lowered with Main Build 124's code (frontend/ampere/build124/) and
+/// the upstream Eglantine runtime heuristics Build 124 did not have stay off for it (the DLSS
+/// replacement chain, the network skip window and the matrix multiply stand-in in KeplerCompute,
+/// inline CPU writes onto GPU-written pages in the buffer cache). The Eglantine v0.1.0-rc3 merge
+/// without this (yoshi-int-build-42) brought back stutter and ghosting in Yoshi.
+inline std::atomic<bool>& YoshiCompatibility() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
 } // namespace Shader::Ampere
