@@ -154,7 +154,6 @@ public:
     [[nodiscard]] U1 GetSparseFromOp(const Value& op);
     [[nodiscard]] U1 GetInBoundsFromOp(const Value& op);
 
-    [[nodiscard]] Value TensorMulAdd(const Value& a, const Value& b, const Value& c, u32 depth);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3,
@@ -196,7 +195,6 @@ public:
     [[nodiscard]] F32 FPCos(const F32& value);
     [[nodiscard]] F32 FPSin(const F32& value);
     [[nodiscard]] F32 FPExp2(const F32& value);
-    [[nodiscard]] F32 FPTanh(const F32& value);
     [[nodiscard]] F32 FPLog2(const F32& value);
     [[nodiscard]] F32F64 FPRecip(const F32F64& value);
     [[nodiscard]] F32F64 FPRecipSqrt(const F32F64& value);

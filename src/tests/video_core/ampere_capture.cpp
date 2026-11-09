@@ -114,15 +114,7 @@ TEST_CASE("Ampere capture and lowering read BRA convergence modes", "[video_core
     REQUIRE(capture.index == 2);
     REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
 
-    // .U (mode 1) only says the predicate is warp-uniform: a plain branch (upstream Eglantine,
-    // Mario Kart World roads).
-    auto uniform = code;
-    uniform[0].words[1] = 0x00000011;
-    REQUIRE(static_cast<bool>(LowerToMaxwell(uniform)));
-
-    // .CONV with a uniform-register mask other than URZ (bit 91) is not lowered.
-    auto masked = code;
-    masked[0].words[1] = 0x00000010;
-    masked[0].words[2] |= 0x08000000U;
-    REQUIRE(!static_cast<bool>(LowerToMaxwell(masked)));
+    auto reserved = code;
+    reserved[0].words[1] = 0x00000011; // mode 1 is not a known form
+    REQUIRE(!static_cast<bool>(LowerToMaxwell(reserved)));
 }

@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <string>
-
 namespace Nx2Sampler {
 
 // EDEN_NX2_SAMPLE=<thread names>: a sampling profiler for named host threads (Windows only).
@@ -14,9 +12,5 @@ namespace Nx2Sampler {
 // function (where the thread is, and everything on its stack) go to EDEN_NX2_SAMPLE_OUT
 // (default nx2_samples.txt).
 void StartFromEnvironment();
-
-/// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
-/// the folded stacks to `out`.folded) and returns the report.
-std::string Sample(const char* names, double seconds, const std::string& out);
 
 } // namespace Nx2Sampler

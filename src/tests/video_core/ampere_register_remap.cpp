@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Guest registers in the range the native lowering reserves for itself (Yoshi's red/yellow area
-// programs be594fabcdb19f53 and fb88b1bef8a89c12 use R200-R250). Since the upstream sync of
-// yoshi-int-build-42, upstream Eglantine's shadow copies (register banks 1 and 2, native register
-// copy MOVs) handle the forms they know, and EdenNS2 main's register remap (extended IR registers,
-// ported for yoshi-int-build-31) the others.
+// Register remap (EdenNS2 main, ported for yoshi-int-build-31): guest registers in the range the
+// native lowering reserves for itself are renamed per instruction and redirected to extended IR
+// registers. Yoshi's red/yellow area programs be594fabcdb19f53 and fb88b1bef8a89c12 use R200-R250.
 
 #include <array>
 #include <optional>
@@ -33,9 +31,9 @@ constexpr Instruction Iadd3(u32 d, u32 a, u32 b) {
     return {{0x00007210U | (d << 16) | (a << 24), b, 0x07ffe0ffU, 0x000fe200U}};
 }
 
-// Executes the lowered code: IADD (reg), native register copies between banks (MOV with bits
-// 44-47 = 0b1010) and EXIT, with each instruction's register remaps applied the way the translator
-// applies them (the remapped low register reads/writes extended register IR::ExtendedReg(to)).
+// Executes the lowered code: IADD (reg) and EXIT, with each instruction's register remaps applied
+// the way the translator applies them (the remapped low register reads/writes extended register
+// 256 + to).
 struct Machine {
     std::array<u32, Shader::IR::NUM_REGS> r{};
 
@@ -44,18 +42,11 @@ struct Machine {
             const u64 insn = lowered.instructions[index];
             const auto reg = [&](u64 field) -> size_t {
                 for (const auto& range : lowered.register_remaps)
-                    if (range.first <= index && index < range.last && range.from == field)
-                        return static_cast<size_t>(Shader::IR::ExtendedReg(range.to));
+                    if (range.first <= index && index < range.last && range.from == field) return 256 + range.to;
                 return field;
             };
             const auto read = [&](u64 field) { return field == 255 ? 0U : r[reg(field)]; };
             if ((insn >> 52) == 0xe30) return true;
-            if ((insn >> 48) == 0x5c98 && ((insn >> 44) & 15) == 10) {
-                const u64 destination = (insn & 0xff) + ((insn >> 8) & 3) * 256;
-                const u64 source = ((insn >> 20) & 0xff) + ((insn >> 10) & 3) * 256;
-                r[destination] = r[source];
-                continue;
-            }
             if (((insn >> 48) & 0xfff8) != 0x5c10 || ((insn >> 16) & 15) != 7 || ((insn >> 43) & 0x7f)) return false;
             const u64 d = insn & 0xff, a = (insn >> 8) & 0xff, b = (insn >> 20) & 0xff;
             if (d != 255) r[reg(d)] = read(a) + read(b);
@@ -70,18 +61,16 @@ TEST_CASE("Guest registers in the reserved range are renamed and redirected", "[
                                            Iadd3(4, 250, 255), Exit}};
     const auto lowered = LowerToMaxwell(code);
     REQUIRE(static_cast<bool>(lowered));
-    // IADD3 is a form the shadow copies know: no remaps, the guest values stay in bank 1.
-    REQUIRE(lowered.register_remaps.empty());
+    REQUIRE(!lowered.register_remaps.empty());
     for (const auto& range : lowered.register_remaps) {
         REQUIRE(range.first <= range.last);
         REQUIRE(range.last <= lowered.instructions.size());
         REQUIRE(range.from < 246);                     // a free low register of that instruction
         REQUIRE(range.to < Shader::IR::NUM_EXTENDED_REGS);
     }
-    // Apart from the copies between banks, the lowered instructions name no reserved register.
+    // The lowered instructions name no reserved register: they all became placeholders.
     for (const u64 insn : lowered.instructions) {
         if ((insn >> 52) == 0xe30) continue;
-        if ((insn >> 48) == 0x5c98 && ((insn >> 44) & 15) == 10) continue;
         for (const u32 shift : {0U, 8U, 20U}) {
             const u32 field = static_cast<u32>((insn >> shift) & 0xff);
             REQUIRE((field < 246 || field == 255));
@@ -98,8 +87,8 @@ TEST_CASE("Guest registers in the reserved range are renamed and redirected", "[
         const u32 r250 = r248 + r3;
         REQUIRE(m.r[3] == r3);
         REQUIRE(m.r[4] == r250);
-        REQUIRE(m.r[256 + 248] == r248);
-        REQUIRE(m.r[256 + 250] == r250);
+        REQUIRE(m.r[256 + Shader::Ampere::ExtendedIndexOfGuestRegister(248)] == r248);
+        REQUIRE(m.r[256 + Shader::Ampere::ExtendedIndexOfGuestRegister(250)] == r250);
         // Placeholders only redirect: every other guest register below the reserved range keeps
         // its value.
         for (u32 reg = 0; reg < 246; ++reg) {
@@ -107,21 +96,6 @@ TEST_CASE("Guest registers in the reserved range are renamed and redirected", "[
             REQUIRE(m.r[reg] == before.r[reg]);
         }
     }
-}
-
-TEST_CASE("Forms the shadow copies don't know fall back to the register remap", "[video_core][ampere][remap]") {
-    // F2FP.PACK_AB R24, R248, R8 (register form): not in PrepareRegisterPressure's table.
-    const std::array<Instruction, 2> code{{{{0xf818723eU, 0x00000008U, 0x000000ffU, 0x000fe200U}}, Exit}};
-    const auto lowered = LowerToMaxwell(code);
-    REQUIRE(static_cast<bool>(lowered));
-    REQUIRE(!lowered.register_remaps.empty());
-    bool remaps_r248 = false;
-    for (const auto& range : lowered.register_remaps) {
-        REQUIRE(range.from < 246);
-        REQUIRE(range.to < Shader::IR::NUM_EXTENDED_REGS);
-        remaps_r248 |= range.to == Shader::Ampere::ExtendedIndexOfGuestRegister(248);
-    }
-    REQUIRE(remaps_r248);
 }
 
 TEST_CASE("Programs outside the reserved range are lowered without remaps", "[video_core][ampere][remap]") {

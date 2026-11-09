@@ -39,20 +39,7 @@ void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
 
 VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
     if (!updatable) {
-        // LOCAL TEST (Zelda): a RomFS with the update already merged (NUP containers) still takes
-        // LayeredFS mods (romfs folders of the title's mods); without, they were never applied.
-        // No update is looked up (no base NCA). Built once.
-        std::scoped_lock lock{layered_mutex};
-        if (!layered_file) {
-            const PatchManager patch_manager{current_process_title_id, filesystem_controller,
-                                             content_provider};
-            layered_file = patch_manager.PatchRomFS(nullptr, file, ContentRecordType::Program,
-                                                    nullptr);
-            if (!layered_file) {
-                layered_file = file;
-            }
-        }
-        return layered_file;
+        return file;
     }
 
     const auto type = ContentRecordType::Program;

@@ -106,7 +106,6 @@ public:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -153,9 +152,6 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
-            // With delayed fence operations the callback waits for this fence's tick, whose
-            // submission may be deferred to the waiting thread itself (the GPU split's back).
-            SubmitDeferred();
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
@@ -191,8 +187,6 @@ protected:
     virtual bool IsFenceSignaled(TFence& fence) const = 0;
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
-    /// Submits command work whose submission was deferred (Vulkan: Scheduler::DeferFlush).
-    virtual void SubmitDeferred() {}
 
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::GPU& gpu;
@@ -244,7 +238,7 @@ private:
         }();
         struct Released {
             TFence fence;
-            OperationList operations;
+            std::deque<std::function<void()>> operations;
             u8 flushes;
         };
         std::vector<Released> batch;
@@ -388,12 +382,8 @@ private:
     }
 
     std::queue<TFence> fences;
-    // LOCAL TEST (Zelda): vectors, not deques. MSVC's deque of std::function holds one element per
-    // block, so every queued operation (one per query report, ~1000 objects a frame in Ocarina's
-    // Kokiri Forest) allocated a block.
-    using OperationList = std::vector<std::function<void()>>;
-    OperationList uncommitted_operations;
-    std::deque<OperationList> pending_operations;
+    std::deque<std::function<void()>> uncommitted_operations;
+    std::deque<std::deque<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
 
