@@ -1152,10 +1152,14 @@ void NS2RecordCompositionProgram(const GraphicsPipelineCacheKey& key, size_t ind
             text << fmt::format("env: handle {:#010x} pixel format {}\n", handle, static_cast<u32>(format));
         }
     };
-    if (const auto* generic = dynamic_cast<const VideoCommon::GenericEnvironment*>(&env)) {
-        write_metadata(generic->NS2TextureTypes(), generic->NS2TexturePixelFormats());
-    } else if (const auto* file = dynamic_cast<const VideoCommon::FileEnvironment*>(&env)) {
-        write_metadata(file->NS2TextureTypes(), file->NS2TexturePixelFormats());
+    // No RTTI (/GR-): the two callers pass FileEnvironment (disk cache, not built in parallel) or
+    // GraphicsEnvironment (the running game) objects.
+    if (from_disk_cache) {
+        const auto& file = static_cast<const VideoCommon::FileEnvironment&>(env);
+        write_metadata(file.NS2TextureTypes(), file.NS2TexturePixelFormats());
+    } else {
+        const auto& generic = static_cast<const VideoCommon::GenericEnvironment&>(env);
+        write_metadata(generic.NS2TextureTypes(), generic.NS2TexturePixelFormats());
     }
     LOG_WARNING(Render_Vulkan, "NS2 Book capture: recorded program {:016x} (pipeline {:016x}, {})",
                 key.unique_hashes[index], key.Hash(), from_disk_cache ? "disk cache" : "runtime");
