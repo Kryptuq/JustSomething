@@ -6,9 +6,6 @@
 
 #pragma once
 
-#include <string>
-#include <utility>
-#include <vector>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -59,14 +56,6 @@ public:
         return static_cast<bool>(pipeline);
     }
 
-    /// NS2 diagnostics: the native program this pipeline runs (NativeProgramKey, 0 if none).
-    void SetNS2NativeKey(u64 key) noexcept {
-        ns2_native_key = key;
-    }
-
-    /// NS2 diagnostics: saves the images the capture run wrote, after its dispatch was recorded.
-    void NS2CaptureAfterDispatch(TextureCache& texture_cache);
-
 private:
     const Device& device;
     vk::PipelineCache& pipeline_cache;
@@ -75,16 +64,6 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
-    u64 ns2_native_key{};  ///< NS2 diagnostics: NativeProgramKey of the native program.
-    u32 ns2_capture_runs{}; ///< NS2 diagnostics: runs counted for the frame capture.
-    u32 ns2_traced_runs{};  ///< NS2 diagnostics: first runs whose resources were logged.
-    /// NS2 diagnostics: written images to save after the capture run's dispatch.
-    std::vector<std::pair<VideoCommon::ImageViewId, std::string>> ns2_capture_after;
-    /// NS2 diagnostics (D5): written storage buffer ranges saved after the dispatch, and where.
-    std::vector<std::pair<GPUVAddr, u64>> ns2_capture_after_buffers;
-    std::string ns2_capture_manifest;
-    Tegra::MemoryManager* ns2_gpu_memory{};
-    BufferCache* ns2_buffer_cache{};
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 

@@ -41,7 +41,6 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/ns2_book_capture.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -214,26 +213,6 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     };
 
     RenderAppletCaptureLayer(framebuffers);
-
-    // NS2 Book capture (diagnostics, video_core/ns2_book_capture.h): the screenshot command arms
-    // it (each screenshot again); the frame after the screenshot frame is captured. The request
-    // is only consumed while the window is shown, so it only arms then.
-    if (renderer_settings.screenshot_requested && render_window.IsShown()) {
-        VideoCommon::NS2BookCapture::Arm();
-    }
-    switch (VideoCommon::NS2BookCapture::OnFramePresented()) {
-    case 1:
-        rasterizer.NS2BookCaptureStart();
-        LOG_WARNING(Render_Vulkan, "NS2 Book capture: capturing the next frame (armed by the screenshot)");
-        break;
-    case 2:
-        rasterizer.NS2BookCaptureFinish();
-        LOG_WARNING(Render_Vulkan, "NS2 Book capture: finished, files in {}",
-                    VideoCommon::NS2BookCapture::Directory().string());
-        break;
-    default:
-        break;
-    }
 
     if (!render_window.IsShown()) {
         return;

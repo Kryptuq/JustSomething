@@ -6,15 +6,12 @@
 
 #pragma once
 
-#include <filesystem>
 #include <atomic>
 #include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
-#include <set>
 #include <span>
-#include <string_view>
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
@@ -227,37 +224,6 @@ public:
 
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
-
-    /// Diagnostics: GPU address, size, layers and format of the image behind a view.
-    [[nodiscard]] std::string DescribeImageView(ImageViewId id);
-
-    /// NS2 diagnostics: downloads mip level 0 of the image behind a view (host data, all layers)
-    /// and writes it with a small header to `path`. Waits for the host GPU. Returns false when
-    /// there is no image.
-    bool NS2CaptureImageView(ImageViewId id, const std::filesystem::path& path);
-
-    /// NS2 Book capture (diagnostics, video_core/ns2_book_capture.h): while the capture frame is
-    /// active, logs one draw or dispatch (render targets for draws, each texture descriptor and the
-    /// image it resolved to) and saves every image once before its first use.
-    void NS2BookCaptureViews(std::string_view what, std::span<const ImageViewInOut> views, bool compute);
-
-    /// NS2 Book capture: logs an event (skipped draw, upload, blit) while the capture frame is active.
-    void NS2BookCaptureNote(std::string_view text);
-
-    /// NS2 Book capture: opens the log at the start of the capture frame.
-    void NS2BookCaptureStart();
-
-    /// NS2 Book capture: saves the host copies of the current colour render targets to the
-    /// composition folder as <tag>_rt<i>_img<id>.ns2img (logged, also when skipped).
-    void NS2BookSaveRenderTargets(std::string_view tag);
-
-    /// NS2 Book capture: writes the summary and closes the log.
-    void NS2BookCaptureFinish();
-
-    /// NS2 Book capture (yoshi-int-build-38): what a graphics texture binding resolved to: the
-    /// image view (type, format, range, size), its image, the sampler (raw TSC words from game
-    /// memory, the sampler table limit, null or not).
-    std::string NS2DescribeSampling(ImageViewId view_id, SamplerId sampler_id, u32 tsc_index);
 
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
@@ -683,11 +649,6 @@ private:
     };
     std::unordered_map<u32, PlaneState> plane_states;
     bool frame_trace{};
-    // NS2 Book capture state (diagnostics).
-    bool NS2CaptureImage(Image& image, const std::filesystem::path& path);
-    std::string NS2BookDescribeImage(ImageId image_id);
-    bool ns2_book_open{};
-    u64 ns2_book_bytes{};
     u64 frame_trace_first_movie_frame{~0ULL};
     u32 frame_trace_ops{};
     std::string frame_trace_line;

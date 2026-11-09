@@ -34,7 +34,6 @@
 #include "common/settings.h"
 #include "video_core/nx2_profile.h"
 #include "common/ns2_frame_trace.h"
-#include "video_core/ns2_book_capture.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -809,56 +808,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(
             std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
-    }
-    if (VideoCommon::NS2BookCapture::Active()) [[unlikely]] {
-        // NS2 Book capture (diagnostics): render targets and textures of this draw. Stage program
-        // hashes in Maxwell stage order (VertexA, VertexB, TessCtrl, TessEval, Geometry, Fragment).
-        const auto& h = key.unique_hashes;
-        texture_cache.NS2BookCaptureViews(
-            fmt::format("graphics stages {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} built={}", h[0], h[1],
-                        h[2], h[3], h[4], h[5], IsBuilt() && pipeline ? 1 : IsBuilt() ? 0 : 2),
-            std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()}, false);
-        if (h[5] == VideoCommon::NS2BookCapture::FailingCompositionProgram) {
-            // yoshi-int-build-38: the failing composition program's bindings as the host binds them.
-            const auto& cbufs{maxwell3d->state.shader_stages[4].const_buffers};
-            const bool via_header{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-            std::string text{fmt::format("    FAILING PROGRAM {:016x} pipeline {:016x} built={} sampler_binding_via_header={} "
-                                         "{} views {} samplers; translated texture descriptors:",
-                                         h[5], key.Hash(), IsBuilt(), via_header, views.size(), samplers.size())};
-            size_t sampler_index = 0;
-            size_t view_base = views.size() - stage_infos[4].texture_descriptors.size() -
-                               stage_infos[4].image_descriptors.size();
-            for (const auto& desc : stage_infos[4].texture_descriptors) {
-                const auto read = [&](u32 cbuf, u32 offset) -> u32 {
-                    return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                               ? gpu_memory->Read<u32>(cbufs[cbuf].address + offset)
-                               : 0xdeadbeefU;
-                };
-                const u32 lhs{read(desc.cbuf_index, desc.cbuf_offset) << desc.shift_left};
-                const u32 rhs{desc.has_secondary
-                                  ? read(desc.secondary_cbuf_index, desc.secondary_cbuf_offset)
-                                        << desc.secondary_shift_left
-                                  : 0U};
-                const auto pair{TexturePair(lhs | rhs, via_header)};
-                text += fmt::format("\n    texture type={} depth={} multisample={} integer={} cbuf{}+{:#x} "
-                                    "secondary={} cbuf{}+{:#x} handle_program={} -> raw {:#010x} TIC {} TSC {}",
-                                    static_cast<u32>(desc.type), desc.is_depth, desc.is_multisample,
-                                    desc.is_integer, desc.cbuf_index, desc.cbuf_offset, desc.has_secondary,
-                                    desc.secondary_cbuf_index, desc.secondary_cbuf_offset,
-                                    static_cast<s32>(desc.handle_program), lhs | rhs, pair.first,
-                                    pair.second);
-                const size_t view_slot = view_base + sampler_index;
-                const size_t sampler_slot = samplers.size() - stage_infos[4].texture_descriptors.size() +
-                                            sampler_index;
-                text += "\n      " + texture_cache.NS2DescribeSampling(
-                                         view_slot < views.size() ? views[view_slot].id : VideoCommon::ImageViewId{},
-                                         sampler_slot < samplers.size() ? samplers[sampler_slot]
-                                                                        : VideoCommon::NULL_SAMPLER_ID,
-                                         pair.second);
-                ++sampler_index;
-            }
-            VideoCommon::NS2BookCapture::Line(text);
-        }
     }
     if (IsBuilt() && !pipeline) {
         return false;

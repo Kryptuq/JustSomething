@@ -41,9 +41,6 @@ struct LoweredNativeCode {
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
-    /// NativeProgramKey of the native instructions (diagnostics: identifies the program across
-    /// emulators whose lowered code differs, e.g. for the frame capture).
-    u64 native_key{};
 };
 
 /// The guest memory the calling thread's last native capture read: the program's header and every
@@ -110,14 +107,6 @@ public:
 
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
-    }
-
-    /// NS2 diagnostics (Book capture): texture types and formats read while this program was translated.
-    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TextureType>& NS2TextureTypes() const noexcept {
-        return texture_types;
-    }
-    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TexturePixelFormat>& NS2TexturePixelFormats() const noexcept {
-        return texture_pixel_formats;
     }
 
 protected:
@@ -269,14 +258,6 @@ public:
     }
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
-
-    /// NS2 diagnostics (Book capture): texture types and formats read while this program was translated.
-    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TextureType>& NS2TextureTypes() const noexcept {
-        return texture_types;
-    }
-    [[nodiscard]] const ::Common::unordered_map<u32, Shader::TexturePixelFormat>& NS2TexturePixelFormats() const noexcept {
-        return texture_pixel_formats;
-    }
 
 private:
     std::vector<u64> code;

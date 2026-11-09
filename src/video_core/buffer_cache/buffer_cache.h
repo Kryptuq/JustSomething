@@ -830,10 +830,14 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
-std::string BufferCache<P>::NS2ReadHostRange(DAddr addr, std::span<u8> out) {
+std::string BufferCache<P>::NS2DescribeRange(DAddr addr, u64 size) {
+    u64 gpu_modified_bytes = 0, trapped_bytes = 0, fence_pending_bytes = 0;
+    gpu_modified_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { gpu_modified_bytes += end - start; });
+    read_trapped_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { trapped_bytes += end - start; });
+    uncommitted_gpu_modified_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { fence_pending_bytes += end - start; });
+    std::vector<u8> host(size, 0);
     std::string buffers;
     if constexpr (USE_MEMORY_MAPS) {
-        const u64 size = out.size();
         ForEachBufferInRange(addr, size, [&](BufferId buffer_id, Buffer& buffer) {
             const DAddr start = (std::max)(addr, buffer.CpuAddr());
             const DAddr end = (std::min)(addr + size, buffer.CpuAddr() + buffer.SizeBytes());
@@ -850,20 +854,9 @@ std::string BufferCache<P>::NS2ReadHostRange(DAddr addr, std::span<u8> out) {
             const std::span<BufferCopy> copies_span(copies.data(), copies.size());
             runtime.CopyBuffer(staging.buffer, buffer, copies_span, true);
             runtime.Finish();
-            std::memcpy(out.data() + (start - addr), staging.mapped_span.data(), end - start);
+            std::memcpy(host.data() + (start - addr), staging.mapped_span.data(), end - start);
         });
     }
-    return buffers;
-}
-
-template <class P>
-std::string BufferCache<P>::NS2DescribeRange(DAddr addr, u64 size) {
-    u64 gpu_modified_bytes = 0, trapped_bytes = 0, fence_pending_bytes = 0;
-    gpu_modified_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { gpu_modified_bytes += end - start; });
-    read_trapped_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { trapped_bytes += end - start; });
-    uncommitted_gpu_modified_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { fence_pending_bytes += end - start; });
-    std::vector<u8> host(size, 0);
-    const std::string buffers = NS2ReadHostRange(addr, host);
     std::vector<u8> guest(size, 0);
     device_memory.ReadBlockUnsafe(addr, guest.data(), size);
     const auto nonzero = [](const std::vector<u8>& bytes) {
