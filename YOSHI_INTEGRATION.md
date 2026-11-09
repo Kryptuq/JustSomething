@@ -486,3 +486,11 @@ page composition at the start of the frame: the illustration/paper draws (fragme
   buffers, vertex/index data, native and lowered programs, render targets before/after each draw)
   to <log dir>/ns2_book_capture_yoshi-integration/captureN/composition/. Ctrl+P while the Book is
   visible; every screenshot captures again.
+
+## yoshi-int-build-38: Book runtime check (diagnostics)
+yoshi-int-build-37 capture: every draw with fragment program 60c4a9ac1580d2bf (illustration, paper,
+icon) leaves the page image unchanged; the text draws work. Their pipeline state is identical to the
+text draws', their inputs are valid, and their translation equals main build-123's and computes the
+right colour offline. This build records how that program is built at runtime (SPIR-V, runtime info,
+texture metadata; runtime_programs/) and which image view and sampler its draws bind, plus the index
+data of the composition draws. Ctrl+P while the Book is visible, as before.
