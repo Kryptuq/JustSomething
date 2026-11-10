@@ -7,6 +7,13 @@
 #include <chrono>
 #include <thread>
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#ifdef _WIN32
+#include "common/windows/timer_resolution.h"
+#endif
+
 #include "common/assert.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -23,6 +30,19 @@
 #include "video_core/renderer_base.h"
 
 namespace VideoCommon::GPUThread {
+
+namespace {
+/// A sleep between polls of suspended channels, as short as the host allows without spinning.
+/// MSVC's std::this_thread::sleep_for rounds up to whole milliseconds (Sleep), so on Windows this
+/// waits one tick of the timer resolution Eden raises at startup (~0.5 ms) instead of ~1-2 ms.
+void ShortPendingSleep() {
+#ifdef _WIN32
+    Common::Windows::SleepForOneTick();
+#else
+    std::this_thread::sleep_for(std::chrono::microseconds{50});
+#endif
+}
+} // Anonymous namespace
 
 namespace {
 
@@ -49,6 +69,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     rasterizer = renderer.ReadRasterizer();
     thread = std::jthread([&](std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPU");
+#ifdef __linux__
+        // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
+        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+#endif
         VideoCommon::GpuSplit::MarkGpuThread();
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
@@ -71,12 +95,18 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
                 if (!state.queue.TryPop(next)) {
                     // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // millisecond, then in short sleeps (title 1 waits ~25 times a second).
+                    // Ocarina of Time waits here ~330 times a second and its present waits for
+                    // the work behind them: with 1 ms sleeps its present waited ~17 ms a frame
+                    // on the GPU fence in Kokiri village, with 50 us sleeps ~1 ms (Lichii
+                    // acb9c18d, #446). A channel still waiting after 2 s (menus, loading) goes
+                    // back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    const auto waited = std::chrono::steady_clock::now() - last_progress;
+                    if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (waited < std::chrono::seconds{2}) {
+                        ShortPendingSleep();
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
