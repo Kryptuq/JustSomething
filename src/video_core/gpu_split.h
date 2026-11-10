@@ -11,6 +11,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/nx2_profile.h"
 
 namespace Core {
 class System;
@@ -129,6 +130,7 @@ public:
             return;
         }
         Defer(func);
+        Nx2Profile::DrainSite site{Nx2Profile::Zone::DrainRun};
         Drain();
     }
 

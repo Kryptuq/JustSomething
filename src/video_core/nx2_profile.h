@@ -50,8 +50,16 @@ enum class Zone : u32 {
     Fence,        ///< Fences made (SignalFence)
     FenceSkipped, ///< Empty fences not made
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
-    SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
+    SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h), other sites
     SplitWait,    ///< Split GPU thread: the back waits for work
+    // Where the front waits for the back (green-hat-build-5; these were "split drain" before):
+    DrainDmaRead, ///< A macro's MME DMA read (Maxwell3D::FrontDmaRead)
+    DrainAcquire, ///< A semaphore acquire before it reads its word (Puller)
+    DrainPoll,    ///< A suspended acquire's poll (Puller::CanResumeAcquire)
+    DrainList,    ///< A command list on GPU-written pages (DmaPusher::FlushGpuWrittenCommands)
+    DrainRun,     ///< Work run on the back and waited for (GpuSplit::Run)
+    DrainRing,    ///< Space in the full ring (GpuSplit::WaitForSpace)
+    WriterWait,   ///< The compute and copy work before a command list fetch (WaitForWriters)
     Count,
 };
 
@@ -62,7 +70,29 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "drain dma read", "drain acquire",
+    "drain poll", "drain list", "drain run", "drain ring", "list writer wait",
+};
+
+/// The zone GpuSplit::Drain charges its wait to on this thread (the caller's site).
+inline thread_local Zone t_drain_zone = Zone::SplitDrain;
+
+/// Charges the drains in its lifetime to `zone` unless an outer site already chose one.
+class DrainSite {
+public:
+    explicit DrainSite(Zone zone) : previous{t_drain_zone} {
+        if (previous == Zone::SplitDrain) {
+            t_drain_zone = zone;
+        }
+    }
+    ~DrainSite() {
+        t_drain_zone = previous;
+    }
+    DrainSite(const DrainSite&) = delete;
+    DrainSite& operator=(const DrainSite&) = delete;
+
+private:
+    Zone previous;
 };
 
 // Set at startup by EDEN_NX2_GPU_PROFILE, or for a title by EnableForTitle (ChannelState::Init).

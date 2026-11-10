@@ -57,7 +57,8 @@ void OnBack(const Func& func) {
     }
 }
 
-void DrainBack() {
+void DrainBack(VideoCommon::Nx2Profile::Zone zone = VideoCommon::Nx2Profile::Zone::DrainAcquire) {
+    VideoCommon::Nx2Profile::DrainSite site{zone};
     VideoCommon::GpuSplit::Get().Drain();
 }
 
@@ -89,7 +90,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
-    DrainBack();
+    DrainBack(VideoCommon::Nx2Profile::Zone::DrainPoll);
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};

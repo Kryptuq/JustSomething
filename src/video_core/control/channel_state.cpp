@@ -75,9 +75,10 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
     program_id = program_id_;
     // Yoshi and the Mysterious Book (full version, demo): its upscaling passes use HMMA, which is
     // lowered to NS2_HMMA for it by default (EdenNS2 main); other titles keep the opt-in.
-    if (program_id == 0x0400486024DEC000ULL) {
-        // Ocarina of Time: the GPU thread profile is logged every 10 s (fix/green-hat
-        // performance work; no behaviour change, small overhead).
+    if (program_id == 0x0400486024DEC000ULL || program_id == 0x0400245021D2C000ULL) {
+        // Ocarina of Time and Yoshi: the GPU thread profile is logged every 10 s (fix/green-hat
+        // performance work and Yoshi's title-screen frame times; no behaviour change, small
+        // overhead).
         VideoCommon::Nx2Profile::EnableForTitle();
     }
     if (program_id == 0x0400245021D2C000ULL || program_id == 0x04007C6028AA8000ULL) {
