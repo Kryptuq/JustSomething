@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -64,11 +65,19 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "fence skipped", "method", "split drain", "split wait",
 };
 
-// Read once at startup: Enabled() runs several times per method write (no guard to check).
-inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+// Set at startup by EDEN_NX2_GPU_PROFILE, or for a title by EnableForTitle (ChannelState::Init).
+// Enabled() runs several times per method write: a relaxed load, no guard to check.
+inline std::atomic<bool> g_enabled{std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr};
 
 inline bool Enabled() {
-    return g_enabled;
+    return g_enabled.load(std::memory_order_relaxed);
+}
+
+/// Profiles without EDEN_NX2_GPU_PROFILE: fix/green-hat measures Ocarina of Time's GPU threads
+/// this way while its gameplay performance is investigated (the zones show whether the GPU
+/// threads or the host GPU hold the frame back, and how long suspended channels are polled).
+inline void EnableForTitle() {
+    g_enabled.store(true, std::memory_order_relaxed);
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones

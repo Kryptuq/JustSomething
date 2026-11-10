@@ -7,6 +7,7 @@
 #include "common/assert.h"
 #include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
@@ -74,6 +75,11 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
     program_id = program_id_;
     // Yoshi and the Mysterious Book (full version, demo): its upscaling passes use HMMA, which is
     // lowered to NS2_HMMA for it by default (EdenNS2 main); other titles keep the opt-in.
+    if (program_id == 0x0400486024DEC000ULL) {
+        // Ocarina of Time: the GPU thread profile is logged every 10 s (fix/green-hat
+        // performance work; no behaviour change, small overhead).
+        VideoCommon::Nx2Profile::EnableForTitle();
+    }
     if (program_id == 0x0400245021D2C000ULL || program_id == 0x04007C6028AA8000ULL) {
         Shader::Ampere::NativeTensorByDefault().store(true, std::memory_order_relaxed);
         // Main Build 124's native capture and lowering, without the newer upstream heuristics.
