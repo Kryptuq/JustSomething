@@ -863,3 +863,26 @@ bypasses upstream's selective downloads (an Ocarina performance cost; can be sco
 Tests: Build 124's own lowering tests run against the pinned code (build124_*.cpp, all pass); the
 25 upstream/merged shader tests pass; touched files compile with -Wall -Wextra -Wshadow.
 Tip: restart the emulator between Yoshi and another game (the Yoshi mode stays on for the session).
+
+## Branch fix/green-hat — green-hat-build-3 (Ocarina performance step 1: fence downloads)
+User results of green-hat-build-2: Ocarina boots, title screen ~60 FPS, cutscene OK, gameplay
+playable but ~23 FPS. Yoshi: title screen with occasional small stutters, cutscenes, gameplay,
+Book and red/yellow area fine, no ghosting or flicker.
+
+Ocarina log (build 2, 1246 s): 0 rejected shaders (80 on build 1), 0 failed native dispatches.
+nx2:vi2 present statistics: title screen ~16.7 ms per present with 3-8 ms blocked on the GPU fence;
+gameplay ~80-100 ms per present with ~40-50 ms blocked on the GPU fence. Runtime pipeline builds
+are concentrated in minutes 9-11 (gameplay start) and stop afterwards while frame times stay, so
+shader compilation is not the steady limit. The settings the emulator picked are the fast ones
+(GPU accuracy Low, asynchronous shaders, 1x resolution, NVIDIA DLSS, FIFO relaxed).
+Yoshi log: 796 pipelines loaded from the disk cache, none built during the title screen (the
+Build 124 code keeps its cache valid); title screen 16.9 ms average with single slow frames.
+
+Change 7e719af2: c6e552ef's downloads of every GPU write at every fence apply only to Yoshi. Other
+Switch 2 titles use upstream rc3's default again (Preflushable parts at fences, read traps for the
+rest). Upstream measured the whole-write downloads at ~5 GB/s in Ocarina's forest (5d742e36);
+Lichii measured read-back flushes as an Ocarina limiter (dc7d6c57b). Yoshi is unchanged.
+Diagnostic 032850d6: "Fence downloads in the last N s: X MiB (Y MiB/s) ..." every 10 s, and the
+existing "CPU read of GPU-written memory" lines now appear for titles with read traps.
+Verification: touched files compile with -Wall -Wextra -Wshadow; uniform_stream_reuse passes.
+Runtime: to be measured by the user (compare the vi2 present statistics with build 2).
