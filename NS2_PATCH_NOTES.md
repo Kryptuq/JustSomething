@@ -886,3 +886,30 @@ Diagnostic 032850d6: "Fence downloads in the last N s: X MiB (Y MiB/s) ..." ever
 existing "CPU read of GPU-written memory" lines now appear for titles with read traps.
 Verification: touched files compile with -Wall -Wextra -Wshadow; uniform_stream_reuse passes.
 Runtime: to be measured by the user (compare the vi2 present statistics with build 2).
+
+## Branch fix/green-hat — green-hat-build-4 (Ocarina performance step 2: suspended-channel polls)
+User results of green-hat-build-3: Ocarina title screen and opening cutscene 59-60 FPS; Deku Tree
+cutscene 20-37 FPS with the picture behind the audio; gameplay ~26 FPS standing, ~17-18 FPS walking.
+Yoshi unchanged (occasional small title-screen stutters, everything else fine).
+
+Measurements (build 3 logs):
+- Ocarina gameplay: ~29-45 ms per present (build 2: 80-100 ms), ~13-27 ms of it blocked on the GPU
+  fence (build 2: 40-50 ms), no vblank slack. Step 1 removed most of the readback cost.
+- Fence downloads: 30-41 MiB/s in ~2,300-2,500 copies at ~1,400-1,650 fences/s. CPU reads of
+  GPU-written memory (read traps): ~705 in ~4 minutes (~3/s). So read-back is now small and
+  Lichii's read-back batching (dc7d6c57b, for ~1,180 trapped reads/s) has little to act on here.
+- No memory pressure (texture cache well below its limits, buffer cache ~510 MiB).
+- Yoshi title screen: c6e552ef still downloads ~790 MiB/s at ~2,200 fences/s; frames 16.9 ms with
+  0.2-0.5 ms vblank slack and single slow frames. Build 124's log (Run A) shows the same pattern
+  (16.9 ms, single 26-68 ms frames per 10 s), so the small stutters are not a regression.
+
+Change 2d2cd94b (adapted from Lichii acb9c18d, #446): a channel suspended on a semaphore the guest
+CPU releases is polled with short sleeps after 500 us of yields instead of 1 ms sleeps (back to 1 ms
+after 2 s). Lichii measured exactly our symptom in Kokiri village (present ~17 ms a frame on the GPU
+fence with 1 ms sleeps, ~1 ms with 50 us sleeps). On Windows the short sleep is one tick of the
+maximum timer resolution (~0.5 ms; MSVC's sleep_for cannot sleep less than 1 ms). All titles.
+Diagnostic 3461d6bf: upstream's GPU thread profile (Nx2Profile; "GPU thread per second: ..." and
+"GPU back thread per second: ..." every 10 s) is on for Ocarina only, so the next log shows whether
+the GPU threads or the host GPU hold the frame back and how long channels are polled.
+Verification: touched files compile with -Wall -Wextra -Wshadow (the Windows branch checked
+separately). Runtime: to be measured by the user.
