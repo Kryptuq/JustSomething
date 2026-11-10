@@ -7,6 +7,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -757,6 +759,39 @@ bool BufferCache<P>::ShouldWaitAsyncFlushes() const noexcept {
     return (!async_buffers.empty() && async_buffers.front().has_value());
 }
 
+/// Logs the buffer data copied back from the host GPU at fences about every 10 s (always on: how
+/// GPU-written data reaches guest memory differs per title, see AsyncBufferDownloads, and its
+/// cost shows up as GPU fence waits in the nx2:vi2 present statistics).
+inline void ReportFenceDownloads(u64 bytes, u64 copies) {
+    static std::atomic<u64> window_bytes{};
+    static std::atomic<u64> window_copies{};
+    static std::atomic<u64> window_fences{};
+    static std::atomic<s64> window_start{};
+    window_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    window_copies.fetch_add(copies, std::memory_order_relaxed);
+    window_fences.fetch_add(1, std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 start = window_start.load(std::memory_order_relaxed);
+    if (start == 0) {
+        window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - start < 10000 ||
+        !window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - start) / 1000.0;
+    const double mib =
+        static_cast<double>(window_bytes.exchange(0, std::memory_order_relaxed)) / 1048576.0;
+    LOG_INFO(HW_GPU,
+             "Fence downloads in the last {:.1f} s: {:.1f} MiB ({:.1f} MiB/s) in {} copies at {} "
+             "fences",
+             seconds, mib, mib / seconds, window_copies.exchange(0, std::memory_order_relaxed),
+             window_fences.exchange(0, std::memory_order_relaxed));
+}
+
 template <class P>
 void BufferCache<P>::CommitAsyncFlushesHigh() {
     AccumulateFlushes();
@@ -826,6 +861,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     }
     Nx2Profile::Add(Nx2Profile::Counter::DownloadBytes, total_size_bytes);
     Nx2Profile::Add(Nx2Profile::Counter::DownloadCopies, downloads.size());
+    ReportFenceDownloads(total_size_bytes, downloads.size());
     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
     boost::container::small_vector<BufferCopy, 4> normalized_copies;
     Common::RangeSet<DAddr> download_ranges;
