@@ -33,6 +33,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "common/spin_recursive_mutex.h"
+#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -643,12 +644,17 @@ private:
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
     /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
-    /// Switch 2 titles too (yoshi-int-build-35): without fence downloads a GPU-written range
-    /// stays marked until something flushes it, and a guest CPU write to such a page is kept as
-    /// a cached write without clearing the mark, so the next flush copied the stale host bytes
-    /// over the CPU's newer data (Yoshi's CPU-written shader code: zero holes and 0xff tails,
-    /// rejected programs, flicker). Skipping them made a fence cost ~1 us instead of ~5 and draw
-    /// setup ~7% less in title 1. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
+    /// Switch 2 titles: only Yoshi and the Mysterious Book (c6e552ef, yoshi-int-build-35): without
+    /// fence downloads a GPU-written range stays marked until something flushes it, and a guest
+    /// CPU write to such a page was kept as a cached write without clearing the mark, so the next
+    /// flush copied the stale host bytes over the CPU's newer data (Yoshi's CPU-written shader
+    /// code: zero holes and 0xff tails, rejected programs, flicker). Other Switch 2 titles keep
+    /// upstream's default (Preflushable parts at fences, read traps for the rest, inline CPU
+    /// writes onto GPU-written pages): downloading every GPU write at every fence copied whole
+    /// storage buffers back (~5 GB/s in Ocarina of Time's forest, upstream 5d742e36) and
+    /// green-hat-build-2 spent about half of each gameplay frame waiting on the GPU fence there.
+    /// Skipping them made a fence cost ~1 us instead of ~5 and draw setup ~7% less in title 1.
+    /// EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
     bool AsyncBufferDownloads() const {
         static const int forced = [] {
             const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
@@ -657,7 +663,8 @@ private:
         if (forced >= 0) {
             return forced == 1;
         }
-        return true;
+        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling() ||
+               Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed);
     }
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
