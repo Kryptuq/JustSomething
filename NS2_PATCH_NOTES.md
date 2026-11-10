@@ -913,3 +913,30 @@ Diagnostic 3461d6bf: upstream's GPU thread profile (Nx2Profile; "GPU thread per 
 the GPU threads or the host GPU hold the frame back and how long channels are polled.
 Verification: touched files compile with -Wall -Wextra -Wshadow (the Windows branch checked
 separately). Runtime: to be measured by the user.
+
+## Branch fix/green-hat — green-hat-build-5 (measurement build: where the GPU threads wait)
+User results of green-hat-build-4: Ocarina Deku Tree cutscene ~20-30 FPS (low ~17), gameplay
+standing ~20-23, walking ~15-20: no improvement over build 3. Yoshi: title-screen stutter still
+present and not on Build 124 (treated as a regression); everything else fine.
+
+Findings from the build 4 profile (Ocarina, gameplay):
+- "pending sleep" 4-17 ms/s: the suspended-channel polls were never significant here, so
+  2d2cd94b could not help. Reverted (fbe0f9e2).
+- The split GPU threads wait for each other: front "split drain" 240-450 ms/s (~16,000/s), back
+  idle ("split wait") 300-500 ms/s; drain time follows frame time (standing ~270 ms/s at ~35 ms
+  per present, walking ~380-450 ms/s at ~47 ms). Neither thread is saturated.
+- Walking doubles the work per frame (~730 draws per frame standing, ~1,600 walking; texture
+  upload bursts of 2.5-3 ms each when new areas load); every per-draw cost and drain grows with it.
+- Macro MME DMA reads 317 KiB/s (~13,500 report-pair reads/s if 24 bytes each): each drains.
+  Lichii measured the same site in Hyrule Field (25,060/s, 253 ms/s of the front), and acquires
+  (7,100/s, 239 ms/s) and list writer waits (7,500/s, 142 ms/s; no zone here, it counts as "push").
+- Matrix maths: this tree has no cooperative-matrix path (Lichii 8318201f, 16x8x16, +12% standing,
+  +24% walking in Ocarina; d5494116 is only the RDNA4 16x16x16 fallback on top). Whether the host
+  GPU is busy enough for it to matter is not in the logs.
+- Yoshi title screen: average 16.9 ms on both, but green-hat spends ~11 ms of each frame outside
+  the GPU fence wait with 0.2-0.5 ms vblank slack, Build 124 ~5.6 ms with 1.7-3 ms slack. Yoshi
+  runs with GPU accuracy High (no split) on both.
+
+Diagnostic 684f78e4: the split drain is charged to its site ("drain dma read", "drain acquire",
+"drain poll", "drain list", "drain run", "drain ring"), WaitForWriters gets a zone ("list writer
+wait"), and the GPU thread profile also runs for Yoshi. No behaviour change.
