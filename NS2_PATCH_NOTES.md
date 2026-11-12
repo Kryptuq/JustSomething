@@ -970,3 +970,25 @@ Yoshi, as on Build 124. "HLE reply holds in the last N s: ..., skipped for Yoshi
 measures it (S = holds Yoshi would have had).
 Verification: touched files compile with -Wall -Wextra -Wshadow. No local unit test covers the
 split's list fetch (Lichii's lives in a full-system test). Runtime: to be measured by the user.
+
+## Branch fix/green-hat — green-hat-build-7 (Yoshi title movie; build 6 changes reverted)
+User results of green-hat-build-6: Ocarina unchanged (standing 21-23, moving 17-20 FPS); Yoshi
+title-screen stutter unchanged.
+
+Yoshi: the HLE reply hold hypothesis is disproven (counter: ~150-220 skipped holds/s, at most
+~0.2 ms a frame) -> 5adac9e1 reverted (65e825b4). The nvdrv pending-map copies (74cd3b43/49d1e8cb)
+never ran for Yoshi (their log line never appears). Settings and mods are identical to Build 124.
+Cause found: the title screen is a 1080p 30 fps H.264 movie, and upstream 1f52ac7e (movie pacing,
+for Ocarina below 60 fps; not in Build 124) dropped its frames as "late": build 6 showed frame 600
+at 24.7 s with 171 dropped (771 decoded, ~31/s = real time), 815 dropped by the end of the 70 s
+stream; build 5: 908. Build 124 showed frame 600 at 19.4 s with on-time timestamps and dropped
+none. Fix 824a92e0: no movie pacing for Yoshi (INx2VideoSession::PacingEnabled), as on Build 124.
+
+Ocarina: c2656dc9 worked as written ("list writer wait" 98-150 -> 6-10 ms/s) but the wait moved to
+the next full drain ("drain acquire" 55-121 -> 160-220 ms/s); total front wait (~400 ms/s) and
+frame times unchanged. The frame is serial by design: Ocarina's present waits for its own frame's
+fence (upstream a23be213, frames_ahead 0, against one-frame flashes), so a standing frame is ~16 ms
+of game CPU work plus ~18 ms of back-thread work (method 5.2 ms, unattributed 5.3, bind stage
+buffers 3.0, the rest ~5), with ~18-20 ms blocked on the GPU fence. Only less back-thread work per
+frame (or a safe frame-ahead present) can raise FPS. c2656dc9 reverted (170af8fa).
+Net source change against build 5: only the Yoshi movie fix (nx2_gsv.h).
