@@ -19,7 +19,6 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
-#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
@@ -148,10 +147,6 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        if (header.sync && VideoCommon::GpuSplit::Get().Active()) {
-            // The GPU completes the work before this entry before fetching it (and later ones).
-            VideoCommon::GpuSplit::Get().NoteSync();
-        }
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -211,20 +206,8 @@ bool DmaPusher::Step() {
         // billions of instances and lost the device loading a race).
         bool gpu_written =
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
-            // Only the compute and copy work before the last host-level wait (NoteSync) is
-            // ordered before the fetch on the hardware: the PBDMA fetches an entry ahead of the
-            // engines running earlier work otherwise, so later work does not write the list
-            // first (adapted from Lichii 1a5e995a, #1056: Ocarina of Time's fetches waited ~7,500
-            // times a second for that work). The page bits are checked again after the wait
-            // either way (a synced writer may have marked them meanwhile). Yoshi and the
-            // Mysterious Book keeps the wait for all of it (indirect dispatch counts, see below).
-            auto& split = VideoCommon::GpuSplit::Get();
-            if (Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed)) {
-                split.WaitForWriters();
-            } else {
-                split.WaitForSyncedWriters();
-            }
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }

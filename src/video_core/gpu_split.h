@@ -148,21 +148,11 @@ public:
     void NoteWriter() {
         last_writer_position = write_position;
     }
-    /// A host-level wait was just sent (a GP entry's sync bit, a syncpoint acquire, a host WFI):
-    /// the GPU completes the work before it before fetching the commands after it.
-    void NoteSync() {
-        synced_writer_position = last_writer_position;
-    }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
-    /// Waits until the back executed the compute and copy work sent before the last NoteSync: the
-    /// writers a command list fetched now is ordered after on the hardware. Returns whether any
-    /// of it was still queued.
-    bool WaitForSyncedWriters();
 
 private:
-    bool WaitForWritersUpTo(u64 position);
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -219,7 +209,6 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
-    u64 synced_writer_position{}; ///< last_writer_position at the last NoteSync
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
