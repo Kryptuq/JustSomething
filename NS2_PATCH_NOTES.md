@@ -1014,3 +1014,27 @@ format, no emulation change. Expected: Ocarina back near build 3's speed while k
 and honest zone times to choose between A and B next.
 Verification: all profiler users compile with -Wall -Wextra -Wshadow (rdtsc only on x86; other
 architectures keep the wall clock). Runtime: to be measured by the user.
+
+## Branch fix/green-hat — green-hat-build-9 (Ocarina: constant buffer rows in one write)
+User result of green-hat-build-8: Ocarina standing 25-26 FPS, walking 20-22 (low 18). Standing is
+back at build 3's speed (~26, no profiler), so the TSC profile (bf3d49ca, kept) no longer costs a
+measurable amount; walking was 17-18 in build 3 and is 20-22 now.
+Build 8 profile, back thread per frame (standing ~31 ms frames / walking ~38.5 ms):
+- method 4.0 / 6.4 ms (walking 166.8 ms/s, 3.29M ring entries/s, ~50 ns each) — largest zone;
+- bind stage buffers 2.9 / 4.5 ms (86,144 binds/s = 2 per draw, 1.36 µs each);
+- other 3.0 / 3.9 ms; update buffers 0.7 / 1.3 ms; compute 0.8 / 1.1 ms;
+- texture upload bursts up to 3-5 ms when new areas load.
+The present still waits for its own frame's fence, so back-thread work adds directly to frame time.
+Choice: Candidate B. Candidate A (page-run cache) only speeds up MaxContinuousRange, which this tree
+calls from UpdateVertexBuffer and the storage buffer bindings, i.e. inside "update buffers"
+(≤1.3 ms a frame) — the most it could save is far below the method zone; rejected.
+Change f5f5e824 (constant buffer part of Lichii 4a0bc9a0, adapted): GpuSplit::Execute collects up to
+64 consecutive single const_buffer.buffer[0..15] ring entries; Maxwell3D::CallConstBufferWords does
+the per-word register work CallMethod did (counters, shadow RAM, register + dirty flags) and writes
+the row to memory once (MemoryManager::WriteWordsCached; the invalidation accumulator still gets each
+word). Clipped rows, macro parameter collection, Switch 2 sparse memory and the write-history/trace
+modes keep the per-word path. One "method" profile scope per row, so build 9 stays comparable with
+build 8. Not used for Yoshi. EDEN_NX2_CB_ROWS=0 turns it off. CallMethodFast is not ported.
+Verification: all touched files compile with -Wall -Wextra -Wshadow. No local test: Lichii's
+comparison test needs a full Core::System/GPU and CI does not build tests. Runtime: to be measured
+by the user; success = lower walking "method" zone AND lower frame time / higher FPS.
