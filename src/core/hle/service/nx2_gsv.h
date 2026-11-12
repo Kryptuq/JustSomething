@@ -2810,13 +2810,20 @@ private:
         TipcReplyWords(ctx, {});
     }
 
-    static bool PacingEnabled() {
+    bool PacingEnabled() const {
         // EDEN_NX2_VDEC_PACE=0: hand out every decoded frame, however late.
         static const bool enabled = [] {
             const char* value = std::getenv("EDEN_NX2_VDEC_PACE");
             return value == nullptr || value[0] != '0';
         }();
-        return enabled;
+        // Not for Yoshi and the Mysterious Book, whose title screen is a 1080p 30 fps movie: it
+        // decodes ahead and acquires on its own 30 fps rhythm, and the movie clock took frames
+        // that were on time for late. green-hat-build-6: 600 frames shown and 171 dropped in
+        // 24.7 s (decoding at real time, ~31 frames/s), 815 dropped by the end of the 70 s
+        // stream; the dropped frames were the title screen's stutter. Build 124 dropped none
+        // (600 frames in 19.4 s, timestamps on time) and did not stutter.
+        const u64 program_id = system.GetApplicationProcessProgramID();
+        return enabled && program_id != 0x0400245021D2C000ULL && program_id != 0x04007C6028AA8000ULL;
     }
 
     static s64 HostTimeUs() {
