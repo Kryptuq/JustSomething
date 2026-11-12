@@ -7,7 +7,6 @@
 #include <tuple>
 #include <utility>
 
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -1246,37 +1245,6 @@ namespace {
 // main thread's next IPC waits, before that frame is reused (otherwise it reads zeros and crashes).
 // When another guest thread got the client's core, give it up to this long before the reply
 // wakes the client. EDEN_NX2_IPC_MIN_US=<n> changes it; 0 turns it off.
-// Logs about every 10 s how often HoldHleReply held a reply and for how long in total, and how
-// many holds it skipped for Yoshi (where they would have started).
-void ReportHleReplyHolds(u64 held_ns, u64 skipped) {
-    static std::atomic<u64> holds{};
-    static std::atomic<u64> hold_ns{};
-    static std::atomic<u64> skips{};
-    static std::atomic<s64> window_start{};
-    if (skipped != 0) {
-        skips.fetch_add(skipped, std::memory_order_relaxed);
-    } else {
-        holds.fetch_add(1, std::memory_order_relaxed);
-        hold_ns.fetch_add(held_ns, std::memory_order_relaxed);
-    }
-    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
-    s64 start = window_start.load(std::memory_order_relaxed);
-    if (start == 0) {
-        window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
-        return;
-    }
-    if (now - start < 10000 ||
-        !window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
-        return;
-    }
-    LOG_INFO(Kernel, "HLE reply holds in the last {:.1f} s: {} ({:.1f} ms), skipped for Yoshi: {}",
-             static_cast<double>(now - start) / 1000.0, holds.exchange(0, std::memory_order_relaxed),
-             static_cast<double>(hold_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
-             skips.exchange(0, std::memory_order_relaxed));
-}
-
 void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
     static const auto hold = std::chrono::microseconds{[] {
         const char* text = std::getenv("EDEN_NX2_IPC_MIN_US");
@@ -1290,37 +1258,15 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
         return;
     }
     const auto& scheduler = kernel.Scheduler(core);
-    const auto other_thread_runs = [&] {
-        const KThread* running = scheduler.GetSchedulerCurrentThread();
-        return running != client_thread && running != scheduler.GetIdleThread();
-    };
-    if (!other_thread_runs()) {
-        return;
-    }
-    // Yoshi and the Mysterious Book (Switch 2) replies at once, as on Main Build 124: its title
-    // screen has ~11 ms of game-side time per 16.9 ms frame on fix/green-hat (Build 124: ~5.6 ms)
-    // while its GPU thread is idle ~60% of the time, so the frame lost its vblank slack and
-    // stutters. Its threads share every core and it makes many service calls per frame, where up
-    // to 50 us each adds up. The skipped holds are counted (ReportHleReplyHolds).
-    if (const KProcess* process = client_thread->GetOwnerProcess();
-        process != nullptr && (process->GetProgramId() == 0x0400245021D2C000ULL ||
-                               process->GetProgramId() == 0x04007C6028AA8000ULL)) {
-        ReportHleReplyHolds(0, 1);
-        return;
-    }
-    const auto start = std::chrono::steady_clock::now();
-    const auto deadline = start + hold;
+    const auto deadline = std::chrono::steady_clock::now() + hold;
     while (std::chrono::steady_clock::now() < deadline) {
         // Stop as soon as the core has nothing else to run.
-        if (!other_thread_runs()) {
-            break;
+        const KThread* running = scheduler.GetSchedulerCurrentThread();
+        if (running == client_thread || running == scheduler.GetIdleThread()) {
+            return;
         }
         std::this_thread::yield();
     }
-    ReportHleReplyHolds(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             std::chrono::steady_clock::now() - start)
-                                             .count()),
-                        0);
 }
 } // namespace
 
