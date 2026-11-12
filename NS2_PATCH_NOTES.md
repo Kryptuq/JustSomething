@@ -992,3 +992,25 @@ of game CPU work plus ~18 ms of back-thread work (method 5.2 ms, unattributed 5.
 buffers 3.0, the rest ~5), with ~18-20 ms blocked on the GPU fence. Only less back-thread work per
 frame (or a safe frame-ahead present) can raise FPS. c2656dc9 reverted (170af8fa).
 Net source change against build 5: only the Yoshi movie fix (nx2_gsv.h).
+
+## Branch fix/green-hat — green-hat-build-8 (Ocarina: cheap GPU thread profile)
+User result of green-hat-build-7: Yoshi's title-screen stutter is gone (log: 2,100 movie frames in
+70 s, 0 late dropped, timestamps on time). Yoshi is frozen from here on; focus is Ocarina only.
+
+Choice for build 8 (neither Lichii candidate first):
+- Candidate A (page-run cache, final form Lichii f1768209, 377 lines): rebuilds device-contiguous
+  runs at every page table change and gives each thread a snapshot; this tree already keeps 4,096
+  MaxContinuousRange answers per thread, and the logs have no hit/miss count, so the ~11% Lichii
+  measured is not shown here. Higher risk in the memory-mapping core.
+- Candidate B (method fast path, Lichii 4a0bc9a0, ~250 lines + 341-line test): turns itself off
+  while the GPU profile runs; our CallMethod is already lean for state writes; and the "method"
+  zone (5.2 ms a standing frame) it targets is partly the profiler's own per-write timing.
+- Measured instead: the profile itself costs Ocarina ~10-15%. Build 3 (no profile): ~29-35 ms per
+  standing present, ~26 FPS; builds 4-7 (profile on): ~34-36 ms, 20-23 FPS. Each zone read the
+  fenced wall clock twice, for ~2.36 million register writes a second on the back thread.
+Change bf3d49ca (adapted from Lichii 5f6066b2): zones measure with the unfenced time stamp counter
+(__rdtsc on x86) and Report converts to milliseconds per second via the window's ticks. Same log
+format, no emulation change. Expected: Ocarina back near build 3's speed while keeping the profile,
+and honest zone times to choose between A and B next.
+Verification: all profiler users compile with -Wall -Wextra -Wshadow (rdtsc only on x86; other
+architectures keep the wall clock). Runtime: to be measured by the user.
