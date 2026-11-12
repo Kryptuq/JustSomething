@@ -3,8 +3,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#define NX2_PROFILE_RDTSC 1
+#elif defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#define NX2_PROFILE_RDTSC 1
+#endif
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -116,12 +124,26 @@ inline u64 Now() {
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
 }
 
+// What the zones measure in: the time stamp counter without the fences the wall clock reads it
+// with. Ocarina of Time's split back thread enters a zone for each of ~2.4 million register writes
+// a second; with the fenced reads the profile slowed its gameplay by ~10-15% (green-hat builds
+// 4-7: ~34-36 ms per standing present against ~29-35 ms without the profile in build 3; Lichii
+// measured the fences at ~10% of the back thread, 5f6066b2). Report converts with the window.
+inline u64 Ticks() {
+#ifdef NX2_PROFILE_RDTSC
+    return __rdtsc();
+#else
+    return Now();
+#endif
+}
+
 struct ThreadData {
-    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{}; ///< In Ticks
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
     std::array<u64, 8> counters{}; ///< See Counter
-    u64 child_ns{};    ///< Time of the zones nested in the current one
+    u64 child_ns{};    ///< Time of the zones nested in the current one (Ticks)
     u64 window_start{};
+    u64 window_start_ticks{};
 };
 
 inline thread_local ThreadData t_data;
@@ -134,14 +156,14 @@ public:
         }
         parent_child_ns = t_data.child_ns;
         t_data.child_ns = 0;
-        start = Now();
+        start = Ticks();
     }
 
     ~Scope() {
         if (!enabled) {
             return;
         }
-        const u64 elapsed = Now() - start;
+        const u64 elapsed = Ticks() - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
         data.exclusive_ns[index] += elapsed - data.child_ns;
@@ -194,6 +216,7 @@ inline void Report(const char* thread_name = "GPU thread") {
     const u64 now = Now();
     if (data.window_start == 0) {
         data.window_start = now;
+        data.window_start_ticks = Ticks();
         data.child_ns = 0;
         return;
     }
@@ -201,19 +224,21 @@ inline void Report(const char* thread_name = "GPU thread") {
     if (window < 10'000'000'000ULL) {
         return;
     }
-    // Time in no zone at all is the wall time minus the zones' totals.
+    // Zone times are in Ticks: shares of the window's ticks, shown per second of wall time.
+    const u64 window_ticks = (std::max<u64>)(Ticks() - data.window_start_ticks, 1);
+    // Time in no zone at all is the window minus the zones' totals.
     u64 zoned{};
     for (size_t i = 1; i < data.exclusive_ns.size(); ++i) {
         zoned += data.exclusive_ns[i];
     }
-    data.exclusive_ns[0] = window > zoned ? window - zoned : 0;
+    data.exclusive_ns[0] = window_ticks > zoned ? window_ticks - zoned : 0;
     std::string line;
     for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {
         if (data.exclusive_ns[i] == 0 && data.count[i] == 0) {
             continue;
         }
         // Per second of wall time: milliseconds spent and calls made.
-        const double ms = static_cast<double>(data.exclusive_ns[i]) * 1000.0 / window;
+        const double ms = static_cast<double>(data.exclusive_ns[i]) * 1000.0 / window_ticks;
         const double calls = static_cast<double>(data.count[i]) * 1e9 / window;
         line += fmt::format(" | {} {:.1f} ms ({:.0f}/s)", zone_names[i], ms, calls);
     }
@@ -232,6 +257,7 @@ inline void Report(const char* thread_name = "GPU thread") {
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;
+    data.window_start_ticks = Ticks();
 }
 
 } // namespace VideoCommon::Nx2Profile
