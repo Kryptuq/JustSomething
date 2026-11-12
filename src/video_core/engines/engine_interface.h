@@ -44,6 +44,9 @@ public:
     }
 
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
+    /// A Maxwell3D whose constant buffer data rows GpuSplit's back uploads in one write
+    /// (Maxwell3D::CallConstBufferWords).
+    bool const_buffer_rows{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};

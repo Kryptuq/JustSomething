@@ -34,6 +34,19 @@ namespace Tegra::Engines {
 /// First register id that is actually a Macro call.
 constexpr u32 MacroRegistersStart = 0xE00;
 
+// EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
+static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
+
+// Constant buffer data rows in one write on the split's back (CallConstBufferWords), unless the
+// register write history or first-write trace wants each word. EDEN_NX2_CB_ROWS=0 turns it off.
+static bool ConstBufferRowsEnabled(bool record_write_history) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CB_ROWS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && !record_write_history && !g_trace_first_method_writes;
+}
+
 Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     : draw_manager()
     , memory_manager{memory_manager_}
@@ -49,6 +62,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
+    const_buffer_rows = ConstBufferRowsEnabled(record_write_history);
 }
 
 Maxwell3D::~Maxwell3D() = default;
@@ -452,8 +466,6 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
     draw_manager.DrawDeferred(*this);
 }
 
-// EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
-static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
 
 void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
     static std::array<bool, Regs::NUM_REGS> seen{};
@@ -795,6 +807,43 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
 
 void Maxwell3D::ProcessCBData(u32 value) {
     ProcessCBMultiData(&value, 1);
+}
+
+// Adapted from zortos293/Lichii 4a0bc9a0 (GPL-3.0-or-later). Does what CallMethod does for each
+// word (they are single writes to const_buffer.buffer[0..15] from GpuSplit's back, outside macro
+// parameter collection): profile counters, shadow RAM, the register and its dirty flags (the first
+// word may issue a deferred draw, before any upload), then ProcessCBData's write and offset step;
+// the words go to memory in one write and the invalidation accumulator gets them one by one.
+void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
+                                     const u32* arguments, u32 count) {
+    const u32 offset = regs.const_buffer.offset;
+    const u64 bytes = u64{count} * sizeof(u32);
+    const GPUVAddr address = regs.const_buffer.Address();
+    // Word by word where CallMethod would do more (macro parameters, the front thread) or
+    // ProcessCBMultiData would drop words past the end of the buffer.
+    if (count > 64 || executing_macro != 0 || !VideoCommon::GpuSplit::OnBackThread() ||
+        address == 0 ||
+        offset > regs.const_buffer.size || bytes > regs.const_buffer.size - offset) {
+        for (u32 i = 0; i < count; ++i) {
+            CallMethod(system, methods[i], arguments[i], true);
+        }
+        return;
+    }
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites, count);
+    }
+    std::array<u32, 64> values;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = methods[i];
+        if (VideoCommon::Nx2Profile::Enabled() && regs.reg_array[method] == arguments[i])
+            [[unlikely]] {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SameValueWrites, 1);
+        }
+        values[i] = ProcessShadowRam(method, arguments[i]);
+        ProcessDirtyRegisters(method, values[i]);
+    }
+    memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
 void Maxwell3D::ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount) {

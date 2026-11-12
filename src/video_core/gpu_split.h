@@ -199,7 +199,9 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
 
     void BackLoop(std::stop_token stop_token);
-    size_t Execute(const u64* entry);
+    /// Runs the entry at `entry` (`words` ring words follow it contiguously) and returns its size,
+    /// or the size of the row of entries it ran together.
+    size_t Execute(const u64* entry, size_t words);
 
     Core::System* system{};
     bool active{};

@@ -25,6 +25,8 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -314,7 +316,7 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
     });
 }
 
-size_t GpuSplit::Execute(const u64* entry) {
+size_t GpuSplit::Execute(const u64* entry, size_t words) {
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
@@ -326,6 +328,40 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        using Tegra::Engines::Maxwell3D;
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (engine->const_buffer_rows && method - cb_data < 16 && (head & HasSegment) == 0 &&
+            !Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed)) {
+            // Single constant buffer data words in a row (macros upload constant buffers word by
+            // word, each an executable entry) run together and go to memory in one write
+            // (Maxwell3D::CallConstBufferWords; adapted from Lichii 4a0bc9a0). Nothing is sunk
+            // between them: they are executable.
+            std::array<u32, 64> methods;
+            std::array<u32, 64> arguments;
+            methods[0] = method;
+            arguments[0] = argument;
+            u32 count = 1;
+            while (count < methods.size() && count < words) {
+                const u64 next = entry[count];
+                const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
+                if (static_cast<Kind>(next & 0xf) != Kind::Method || (next & HasSegment) != 0 ||
+                    next_method - cb_data >= 16) {
+                    break;
+                }
+                methods[count] = next_method;
+                arguments[count] = static_cast<u32>(next >> 32);
+                ++count;
+            }
+            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+            engine->ConsumeSink(*system);
+            auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+            if (count == 1) {
+                maxwell3d->CallMethod(*system, method, argument, true);
+            } else {
+                maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(), count);
+            }
+            return count;
+        }
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
@@ -421,7 +457,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         g_back_busy.store(true, std::memory_order_relaxed);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
-            const size_t size = Execute(&ring[index]);
+            const size_t size =
+                Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
