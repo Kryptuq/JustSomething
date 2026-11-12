@@ -940,3 +940,33 @@ Findings from the build 4 profile (Ocarina, gameplay):
 Diagnostic 684f78e4: the split drain is charged to its site ("drain dma read", "drain acquire",
 "drain poll", "drain list", "drain run", "drain ring"), WaitForWriters gets a zone ("list writer
 wait"), and the GPU thread profile also runs for Yoshi. No behaviour change.
+
+## Branch fix/green-hat — green-hat-build-6 (Ocarina: list writer waits; Yoshi: HLE reply holds)
+User results of green-hat-build-5: Ocarina unchanged; GPU 0 "3D" load ~12-13% (brief 16%) while
+walking on the RTX 5070 Ti. Yoshi title-screen stutter still present (not on Build 124).
+
+Ocarina, front GPU thread waits in gameplay (build 5 profile, ms per second):
+- macro DMA reads ("drain dma read") 170-240 standing, 250-323 walking (5,000-13,700/s): ~55%;
+- semaphore acquires 55-68 standing, 100-121 walking (~2,000-3,300/s): ~20%;
+- list writer waits 98-150 (3,300-5,300/s), flat: ~25%; polls, lists, Run, ring full ~0.
+Walking adds mostly DMA-read and acquire time. The DMA-read wait has no small fix: Lichii's narrower
+pre-#1056 wait still cost 252.8 ms/s in Hyrule Field (the report pair is written by the work just
+before the read); only running the macro on the back (#1056, ~1,100 lines on top of #1028) removes
+it. The 3D load of ~12-16% shows the host GPU is not the limit, so cooperative-matrix HMMA
+(Lichii 8318201f) is not a priority: it would shorten GPU execution, which is not what the frame
+waits for.
+
+Change c2656dc9 (adapted from Lichii 1a5e995a, #1056 part 1 + its review fix): a command list fetch
+on unmarked pages waits only for the compute/copy work before the last host-level wait (GP entry
+sync bit, syncpoint acquire, host WFI: NoteSync) instead of all of it, and rechecks the page bits
+after the wait. Expected: up to ~100-150 ms per second less front waiting in Ocarina. Yoshi keeps
+the full wait.
+
+Yoshi title screen: Build 124 ~5.6 ms game-side time per 16.9 ms frame (1.7-3 ms vblank slack),
+green-hat ~11 ms (0.2-0.5 ms). Its GPU thread is idle ~610 ms/s (not GPU-thread bound); the
+profiler adds nothing measurable (build 4 = build 5 statistics). Change 5adac9e1: the 50 us hold
+before HLE service replies (9757e3b1, for Mario Tennis Fever; not in Build 124) is skipped for
+Yoshi, as on Build 124. "HLE reply holds in the last N s: ..., skipped for Yoshi: S" every 10 s
+measures it (S = holds Yoshi would have had).
+Verification: touched files compile with -Wall -Wextra -Wshadow. No local unit test covers the
+split's list fetch (Lichii's lives in a full-system test). Runtime: to be measured by the user.
