@@ -1038,3 +1038,10 @@ build 8. Not used for Yoshi. EDEN_NX2_CB_ROWS=0 turns it off. CallMethodFast is 
 Verification: all touched files compile with -Wall -Wextra -Wshadow. No local test: Lichii's
 comparison test needs a full Core::System/GPU and CI does not build tests. Runtime: to be measured
 by the user; success = lower walking "method" zone AND lower frame time / higher FPS.
+
+## Branch fix/green-hat — green-hat-build-10 (build pipeline test after the move to Forgejo)
+- No emulator change: same code as green-hat-build-9 (f5f5e824).
+- The repository moved to https://git.eden-emu.dev/Krypduck/EglantineNS2 (Forgejo). It is
+  push-mirrored to a GitHub repository only to build on GitHub's Windows runners; the workflow
+  `build-windows-green-hat.yml` now publishes the release on Forgejo (2b8a63db). Releases from
+  here on: https://git.eden-emu.dev/Krypduck/EglantineNS2/releases (numbering continues at 10).
