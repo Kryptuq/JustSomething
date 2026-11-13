@@ -93,17 +93,32 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path release/* -DestinationPath eden-ns2-windows-x64.zip
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: green-hat-build-${{ github.run_number }}
-          name: Eden NS2 green-hat build ${{ github.run_number }} (Ocarina test branch)
-          target_commitish: ${{ github.sha }}
-          prerelease: true
-          files: eden-ns2-windows-x64.zip
-          body: |
-            Windows x64 test build of the EdenNS2 development branch fix/green-hat: Eglantine (Djihads80/Eglantine nx2, v0.1.0-rc3 from green-hat-build-2 on) with the EdenNS2 Yoshi fixes, built from ${{ github.sha }}. Notes: NS2_PATCH_NOTES.md.
+      # Since 2026-11-13 the code lives on Forgejo (git.eden-emu.dev/Krypduck/EglantineNS2) and is
+      # push-mirrored to a GitHub repo only to use GitHub's Windows runners. The release is published
+      # on Forgejo. Run numbers restart in the build repo, so BUILD_OFFSET continues after build 9.
+      - name: Publish release on Forgejo
+        shell: bash
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          FORGEJO_API: https://git.eden-emu.dev/api/v1/repos/Krypduck/EglantineNS2
+          BUILD_OFFSET: "9"
+        run: |
+          set -euo pipefail
+          if [ -z "${FORGEJO_TOKEN}" ]; then echo "::error::secret FORGEJO_TOKEN is missing"; exit 1; fi
+          n=$(( ${{ github.run_number }} + BUILD_OFFSET ))
+          tag="green-hat-build-${n}"
+          body="Windows x64 test build of the EglantineNS2 development branch fix/green-hat (Eglantine nx2 with the NS2 Yoshi/Ocarina fixes), built from ${{ github.sha }}. Notes: NS2_PATCH_NOTES.md.
 
-            Unzip and run `eglantine.exe` (single file, Qt built in). If Windows reports a missing MSVCP140/VCRUNTIME140 DLL, install the Microsoft Visual C++ Redistributable (x64).
-            Optional portable mode: create an empty `user` folder next to `eglantine.exe` to keep settings, keys and logs there instead of %APPDATA%\eden.
-            Experimental: Switch 2 titles will most likely not run, and regular Switch games may behave differently than in stock Eden.
+          Unzip and run eglantine.exe (single file, Qt built in). If Windows reports a missing MSVCP140/VCRUNTIME140 DLL, install the Microsoft Visual C++ Redistributable (x64).
+          Experimental: Switch 2 titles will most likely not run, and regular Switch games may behave differently than in stock Eden."
+          jq -n --arg tag "$tag" --arg sha "${{ github.sha }}" --arg body "$body" \
+            --arg name "EglantineNS2 green-hat build ${n} (Ocarina test branch)" \
+            '{tag_name:$tag, target_commitish:$sha, name:$name, body:$body, draft:false, prerelease:true}' > release.json
+          curl -sS --fail-with-body -X POST -H "Authorization: token ${FORGEJO_TOKEN}" \
+            -H "Content-Type: application/json" --data @release.json "${FORGEJO_API}/releases" > created.json
+          id=$(jq -r .id created.json)
+          curl -sS --fail-with-body -X POST -H "Authorization: token ${FORGEJO_TOKEN}" \
+            -F "attachment=@eden-ns2-windows-x64.zip" \
+            "${FORGEJO_API}/releases/${id}/assets?name=eden-ns2-windows-x64.zip" > asset.json
+          echo "Release: https://git.eden-emu.dev/Krypduck/EglantineNS2/releases/tag/${tag}"
+          jq -r '"asset \(.name) \(.size) bytes"' asset.json
