@@ -1059,3 +1059,12 @@ by the user; success = lower walking "method" zone AND lower frame time / higher
   (bank size, already re-uploaded this frame) before the memory tracker query, as Lichii orders it.
   Same banks re-uploaded; one tracker query less on nearly every uniform bind.
 - Not changed: Yoshi rendering, video pacing and compatibility code; bf3d49ca, 824a92e0 kept.
+
+## Branch fix/green-hat — green-hat-build-12 (diagnostic: macro DMA read drains)
+- Build 11 result: no measurable change (uniform tracker queries per bind 1.85 -> 0.88, bind stage
+  buffers cost unchanged). Main stall found: Maxwell3D::FrontDmaRead drains the whole split before
+  each macro DMA read (~16,000/s walking, ~24 bytes each, front waits ~211 ms/s).
+- Diagnostic only (profile on): classes every read by what is queued before the drain (empty,
+  overlap, any, unrelated, overflow), notes which writers are queued, the top macros and source
+  pages. Log lines every 10 s start with "nx2: macro DMA read". No change to synchronization or
+  rendering; build 11 changes, build 9 batching and the Yoshi fixes unchanged.
