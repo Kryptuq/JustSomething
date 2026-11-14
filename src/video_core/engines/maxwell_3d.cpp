@@ -1303,7 +1303,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
         diag_sample = VideoCommon::Nx2DmaReadDiag::BeginRead(
             split.DiagExecuted(), split.WritePosition(), diag_source, diag_bytes, cb_address,
-            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)]);
+            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)], method == 0x158);
     }
     VideoCommon::Nx2Profile::DrainSite site{VideoCommon::Nx2Profile::Zone::DrainDmaRead};
     split.Drain();

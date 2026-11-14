@@ -69,6 +69,7 @@ struct MacroStats {
     u64 reads;
     u64 bytes;
     u64 ticks;
+    u64 fifo; ///< Of reads: MME_DMA_READ_FIFOED (0x158, into the parameter FIFO)
     std::array<u64, static_cast<size_t>(Bucket::Count)> buckets;
 };
 
@@ -90,6 +91,7 @@ struct State {
     // Window statistics.
     u64 reads{};
     u64 bytes{};
+    u64 fifo_reads{}; ///< MME_DMA_READ_FIFOED (0x158); the others are MME_DMA_READ (0x157)
     std::array<u64, static_cast<size_t>(Bucket::Count)> bucket_reads{};
     std::array<u64, static_cast<size_t>(Bucket::Count)> bucket_ticks{};
     std::array<u64, static_cast<size_t>(Bucket::Count)> bucket_depth{};
@@ -138,13 +140,15 @@ struct Sample {
     u32 macro;
     GPUVAddr source;
     u64 bytes;
+    bool fifo;
 };
 
 /// Before the drain: what is queued, `executed` the back's position, `written` the front's.
 [[nodiscard]] inline Sample BeginRead(u64 executed, u64 written, GPUVAddr source, u64 bytes,
-                                      GPUVAddr cb_address, u64 cb_size) {
+                                      GPUVAddr cb_address, u64 cb_size, bool fifo) {
     State& s = g_state;
     Sample sample{};
+    sample.fifo = fifo;
     sample.macro = s.current_macro;
     sample.source = source;
     sample.bytes = bytes;
@@ -236,9 +240,10 @@ inline void Report() {
         static_cast<double>((std::max<u64>)(now_ticks - s.window_start_ticks, 1)) / window_ns;
     const double per_second = 1e9 / window_ns;
     const auto ms = [&](u64 ticks) { return static_cast<double>(ticks) / ticks_per_ns / 1e6 * per_second; };
-    std::string line = fmt::format("nx2: macro DMA reads per second: {:.0f} reads, {:.0f} bytes; "
-                                   "source in the bound constant buffer {:.0f}, at a report address {:.0f}",
-                                   s.reads * per_second, s.bytes * per_second,
+    std::string line = fmt::format("nx2: macro DMA reads per second: {:.0f} reads ({:.0f} into the FIFO), "
+                                   "{:.0f} bytes; source in the bound constant buffer {:.0f}, at a "
+                                   "report address {:.0f}",
+                                   s.reads * per_second, s.fifo_reads * per_second, s.bytes * per_second,
                                    s.source_current_cb * per_second, s.source_report * per_second);
     for (size_t b = 0; b < s.bucket_reads.size(); ++b) {
         const u64 n = s.bucket_reads[b];
@@ -267,12 +272,12 @@ inline void Report() {
     std::array<MacroStats, 64> macros = s.macros;
     std::sort(macros.begin(), macros.end(),
               [](const MacroStats& a, const MacroStats& b) { return a.reads > b.reads; });
-    line = "nx2: macro DMA reads by macro (method: reads/s, bytes/read, drain ms/s, "
+    line = "nx2: macro DMA reads by macro (method: reads/s, FIFO reads/s, bytes/read, drain ms/s, "
            "empty/overlap/any/unrelated/overflow per s)";
     for (size_t i = 0; i < 6 && macros[i].reads != 0; ++i) {
         const MacroStats& m = macros[i];
-        line += fmt::format(" | {:#x}: {:.0f}, {:.0f}, {:.1f}, {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}",
-                            m.macro, m.reads * per_second,
+        line += fmt::format(" | {:#x}: {:.0f}, {:.0f}, {:.0f}, {:.1f}, {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}",
+                            m.macro, m.reads * per_second, m.fifo * per_second,
                             static_cast<double>(m.bytes) / m.reads, ms(m.ticks),
                             m.buckets[0] * per_second, m.buckets[1] * per_second,
                             m.buckets[2] * per_second, m.buckets[3] * per_second,
@@ -313,6 +318,9 @@ inline void EndRead(const Sample& sample, bool dirty) {
     const size_t b = static_cast<size_t>(sample.bucket);
     ++s.reads;
     s.bytes += sample.bytes;
+    if (sample.fifo) {
+        ++s.fifo_reads;
+    }
     ++s.bucket_reads[b];
     s.bucket_ticks[b] += ticks;
     s.bucket_depth[b] += sample.depth;
@@ -331,6 +339,9 @@ inline void EndRead(const Sample& sample, bool dirty) {
             m.macro = sample.macro;
             ++m.reads;
             m.bytes += sample.bytes;
+            if (sample.fifo) {
+                ++m.fifo;
+            }
             m.ticks += ticks;
             ++m.buckets[b];
             break;
