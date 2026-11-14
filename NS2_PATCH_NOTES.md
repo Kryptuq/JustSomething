@@ -1045,3 +1045,17 @@ by the user; success = lower walking "method" zone AND lower frame time / higher
   push-mirrored to a GitHub repository only to build on GitHub's Windows runners; the workflow
   `build-windows-green-hat.yml` now publishes the release on Forgejo (2b8a63db). Releases from
   here on: https://git.eden-emu.dev/Krypduck/EglantineNS2/releases (numbering continues at 10).
+
+## Branch fix/green-hat — green-hat-build-11 (Ocarina: cheaper uniform buffer binds + bind counters)
+- Build 10 A/B (two runs each, same exe, `EDEN_NX2_CB_ROWS=0` for OFF): the constant buffer row
+  batching of build 9 (f5f5e824) works and is kept. Calls per register write 1.16 ON vs 1.21 OFF
+  (all runs), "method" per frame standing 4.22 vs 4.65 ms, walking 6.26 vs 6.88 ms (-9 %), GPU back
+  thread busy -3 %, front "drain dma read" -4 %; presents per second +1.2-1.6 %, inside the
+  run-to-run spread.
+- 6f27d46: the GPU thread profile counts every graphics uniform buffer bind and its path (64 KiB
+  bank, streamed, reused, cached), the memory tracker queries those binds make and the bytes
+  streamed. Counters only, while the profile runs.
+- a5bae60: BindHostGraphicsUniformBuffer tests the cheap conditions of the native bank re-upload
+  (bank size, already re-uploaded this frame) before the memory tracker query, as Lichii orders it.
+  Same banks re-uploaded; one tracker query less on nearly every uniform bind.
+- Not changed: Yoshi rendering, video pacing and compatibility code; bf3d49ca, 824a92e0 kept.
