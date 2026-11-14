@@ -1060,7 +1060,9 @@ by the user; success = lower walking "method" zone AND lower frame time / higher
   Same banks re-uploaded; one tracker query less on nearly every uniform bind.
 - Not changed: Yoshi rendering, video pacing and compatibility code; bf3d49ca, 824a92e0 kept.
 
-## Branch fix/green-hat — green-hat-build-12 (diagnostic: macro DMA read drains)
+## Branch fix/green-hat — green-hat-build-12/13 (diagnostic: macro DMA read drains)
+- Build 13 adds the count of reads into the parameter FIFO (0x158) apart from reads
+  into the data RAM (0x157); build 12 lacks it. Test build 13.
 - Build 11 result: no measurable change (uniform tracker queries per bind 1.85 -> 0.88, bind stage
   buffers cost unchanged). Main stall found: Maxwell3D::FrontDmaRead drains the whole split before
   each macro DMA read (~16,000/s walking, ~24 bytes each, front waits ~211 ms/s).
