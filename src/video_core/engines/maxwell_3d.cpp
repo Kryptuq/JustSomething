@@ -1314,15 +1314,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    const bool dirty =
+    const bool memory_dirty =
         memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
-    if (dirty) {
+    if (memory_dirty) {
         split.Run([memory = &memory_manager, source, read_bytes] {
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
         });
     }
     if (diag) [[unlikely]] {
-        VideoCommon::Nx2DmaReadDiag::EndRead(diag_sample, dirty);
+        VideoCommon::Nx2DmaReadDiag::EndRead(diag_sample, memory_dirty);
     }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
