@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
 
@@ -99,13 +100,16 @@ template <class Runtime, class DeviceMemory>
     typename Reuse::Slot& slot = reuse.slots[stage][index];
     u8* const scratch = reuse.scratch.data();
     device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    Nx2Profile::Add(Nx2Profile::Counter::UniformStreamBytes, size);
 
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
+        Nx2Profile::Add(Nx2Profile::Counter::UniformStreamReused, 1);
         return true;
     }
+    Nx2Profile::Add(Nx2Profile::Counter::UniformStreamNew, 1);
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
     std::memcpy(span.data(), scratch, size);
     slot.ref = runtime.LastStreamUniformRef();

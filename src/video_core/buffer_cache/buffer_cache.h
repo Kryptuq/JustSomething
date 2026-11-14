@@ -1239,6 +1239,7 @@ template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index,
                                                    bool needs_bind) {
     ++channel_state->uniform_cache_shots[0];
+    Nx2Profile::Add(Nx2Profile::Counter::UniformBinds, 1);
     // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
     // bind: stream the table's current words as that buffer.
     if (index == 17 && maxwell3d->root_tables.loaded &&
@@ -1264,6 +1265,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const Binding& binding = channel_state->uniform_buffers[stage][index];
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
+    if ((*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) {
+        Nx2Profile::Add(Nx2Profile::Counter::UniformBank64K, 1);
+    }
+    // The memory tracker queries below, counted while profiling.
+    const auto gpu_modified = [&] {
+        Nx2Profile::Add(Nx2Profile::Counter::UniformTrackerQueries, 1);
+        return memory_tracker.IsRegionGpuModified(device_addr, size);
+    };
     Buffer& buffer = slot_buffers[binding.buffer_id];
     TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
@@ -1291,8 +1300,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         return v != nullptr ? v[0] : '1';
     }();
     const bool native_bank = has_host_buffer && size != 0 && gpu_memory != nullptr &&
-                             gpu_memory->UsesNativeTiling() &&
-                             !memory_tracker.IsRegionGpuModified(device_addr, size);
+                             gpu_memory->UsesNativeTiling() && !gpu_modified();
     if (bank_mode != '0' && native_bank &&
         (bank_mode == '3' || (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) &&
         (bank_mode == '2' || bank_mode == '3' ||
@@ -1321,7 +1329,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const bool use_fast_buffer =
         needs_alignment_stream ||
         (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-         !memory_tracker.IsRegionGpuModified(device_addr, size));
+         !gpu_modified());
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -1354,12 +1362,15 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             }
         }
         if (!streamed) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformStreamNew, 1);
+            Nx2Profile::Add(Nx2Profile::Counter::UniformStreamBytes, size);
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
         }
         return;
     }
     // Classic cached path
+    Nx2Profile::Add(Nx2Profile::Counter::UniformCached, 1);
     if (SynchronizeBuffer(buffer, device_addr, size)) {
         ++channel_state->uniform_cache_hits[0];
     }
