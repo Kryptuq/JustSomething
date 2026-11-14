@@ -173,6 +173,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    diag_executed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
 }
 
@@ -452,6 +453,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        // Diagnostics (nx2_dma_read_diag.h): the executed position after every entry.
+        const bool diag_positions = Nx2Profile::Enabled();
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
         g_back_busy.store(true, std::memory_order_relaxed);
@@ -460,6 +463,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
+            if (diag_positions) [[unlikely]] {
+                diag_executed.store(read_position, std::memory_order_relaxed);
+            }
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);

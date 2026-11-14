@@ -152,6 +152,16 @@ public:
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
 
+    /// Diagnostics (nx2_dma_read_diag.h), front only: the ring position after the last entry sent.
+    [[nodiscard]] u64 WritePosition() const {
+        return write_position;
+    }
+    /// Diagnostics: the back's position after the last entry it executed. Kept only while the GPU
+    /// thread profile runs (BackLoop), else 0.
+    [[nodiscard]] u64 DiagExecuted() const {
+        return diag_executed.load(std::memory_order_relaxed);
+    }
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -240,6 +250,8 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
+    /// Diagnostics only (DiagExecuted): stored after every entry while the profile runs.
+    alignas(128) std::atomic<u64> diag_executed{};
     /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};

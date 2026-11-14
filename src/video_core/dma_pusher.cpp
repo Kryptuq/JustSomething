@@ -14,6 +14,7 @@
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_dma_read_diag.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
@@ -55,6 +56,50 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
         }
     }
     return false;
+}
+
+// Diagnostics (nx2_dma_read_diag.h), while the profile runs: work of the engines other than 3D
+// that can write guest memory, noted with the ring position the split reached after sending it.
+void DiagNoteEngineWrite(Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
+                         u32 count, bool writer) {
+    namespace Diag = VideoCommon::Nx2DmaReadDiag;
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    const auto executable = [&] {
+        for (u32 i = 0; i < count; ++i) {
+            const u32 current = method + i;
+            if (current < engine->execution_mask.size() && engine->execution_mask[current]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const u64 position = VideoCommon::GpuSplit::Get().WritePosition();
+    switch (type) {
+    case Engines::EngineTypes::KeplerCompute:
+        if (writer) {
+            Diag::NoteUnranged(Diag::Writer::Compute, position);
+        }
+        break;
+    case Engines::EngineTypes::MaxwellDMA:
+        if (writer) {
+            Diag::NoteUnranged(Diag::Writer::Copy, position);
+        }
+        break;
+    case Engines::EngineTypes::KeplerMemory:
+        if (executable()) {
+            Diag::NoteUnranged(Diag::Writer::MemoryEngine, position);
+        }
+        break;
+    case Engines::EngineTypes::Fermi2D:
+        if (executable()) {
+            Diag::NoteUnranged(Diag::Writer::Fermi2D, position);
+        }
+        break;
+    default:
+        break;
+    }
 }
 } // Anonymous namespace
 
@@ -598,6 +643,12 @@ void DmaPusher::CallMethod(u32 argument) {
                 split.NoteWriter();
             }
         };
+        SCOPE_EXIT {
+            if (split.Active()) {
+                DiagNoteEngineWrite(subchannel, subchannel_type[dma_state.subchannel],
+                                    dma_state.method, 1, writer);
+            }
+        };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
@@ -654,6 +705,13 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            }
+        };
+        SCOPE_EXIT {
+            if (split.Active()) {
+                DiagNoteEngineWrite(subchannel, subchannel_type[dma_state.subchannel],
+                                    dma_state.method,
+                                    dma_state.non_incrementing ? 1 : num_methods, writer);
             }
         };
         if (split.Active()) {

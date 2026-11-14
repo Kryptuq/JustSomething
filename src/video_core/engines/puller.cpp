@@ -9,9 +9,11 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_dma_read_diag.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -228,6 +230,17 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
+    // Diagnostics (nx2_dma_read_diag.h): a release writes the 16 bytes at the semaphore address,
+    // on the back once the split queues it.
+    SCOPE_EXIT {
+        if (op == GpuSemaphoreOperation::WriteLong && VideoCommon::Nx2Profile::Enabled() &&
+            VideoCommon::GpuSplit::Get().Active()) [[unlikely]] {
+            VideoCommon::Nx2DmaReadDiag::NoteRange(
+                VideoCommon::Nx2DmaReadDiag::Writer::PullerRelease,
+                VideoCommon::GpuSplit::Get().WritePosition(),
+                regs.semaphore_address.SemaphoreAddress(), 16);
+        }
+    };
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
     static const GPUVAddr watch = [] {
         const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
