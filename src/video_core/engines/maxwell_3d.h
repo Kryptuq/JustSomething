@@ -3402,6 +3402,15 @@ private:
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+    /// Ocarina's macro 0xe2c on the split's back (nx2_back_macro.h, green-hat-build-16). The front
+    /// takes render_enable.mode (register, shadow RAM entry) back from the back: drain, copy.
+    void FrontSyncBackOwned(VideoCommon::GpuSplit& split, FrontState& state);
+    /// Back: runs the macro's code (`verify`: without side effects, kept for the comparison).
+    void BackRunMacroE2C(Core::System& system, std::span<const u32> parameters, bool verify,
+                         u64 sequence, u64 position);
+    /// Back (verify): compares the dry run with the original run's writes and words read.
+    void BackCompareMacroE2C(std::span<const u32> writes, std::span<const u32> words,
+                             u64 sequence, u64 position);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
     bool front_macros{};

@@ -7,9 +7,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string_view>
+#include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -25,6 +28,8 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_dma_read_diag.h"
 #include "video_core/nx2_macro_diag.h"
+#include "video_core/engines/nx2_back_macro.h"
+#include "shader_recompiler/frontend/ampere/native_options.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
@@ -902,6 +907,12 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// Macro 0xe2c run on the back (nx2_back_macro.h): render_enable.mode, and its shadow RAM entry,
+    /// as the back holds them after the last such call, not known to the front until it takes them
+    /// back (FrontSyncBackOwned) or a front write sets them.
+    bool back_owns_render_enable{};
+    bool back_owns_render_enable_shadow{};
+    u64 back_macro_sequence{};
 };
 
 namespace {
@@ -1032,6 +1043,11 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 void Maxwell3D::ReleaseFront() {
     executing_macro = front->executing_macro;
     macro_params = std::move(front->parameters);
+    if (front->back_owns_render_enable_shadow) {
+        // Macro 0xe2c's back runs (nx2_back_macro.h) set this entry; the front's copy is older.
+        front->shadow[Nx2BackMacro::kRenderEnableMode] =
+            shadow_state.reg_array[Nx2BackMacro::kRenderEnableMode];
+    }
     std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
     shadow_state.shadow_ram_control = front->control;
     front.reset();
@@ -1042,6 +1058,21 @@ void Maxwell3D::ReleaseFront() {
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
+    if (method == Nx2BackMacro::kRenderEnableMode &&
+        (fs.back_owns_render_enable || fs.back_owns_render_enable_shadow)) [[unlikely]] {
+        // render_enable.mode as a back run of macro 0xe2c left it: a Replay write reads the shadow
+        // RAM entry, so take it back first; otherwise this write sets the register (and, tracked,
+        // the entry) for the front as for the back, which runs it after those calls.
+        if (fs.control == Regs::ShadowRamControl::Replay && fs.back_owns_render_enable_shadow) {
+            FrontSyncBackOwned(split, fs);
+        } else {
+            fs.back_owns_render_enable = false;
+            if (fs.control == Regs::ShadowRamControl::Track ||
+                fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+                fs.back_owns_render_enable_shadow = false;
+            }
+        }
+    }
     // As ProcessShadowRam does on the back.
     u32 value = argument;
     bool shadow_kept = true;
@@ -1161,6 +1192,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
+    if (method == Nx2BackMacro::kRenderEnableMode &&
+        (fs.back_owns_render_enable || fs.back_owns_render_enable_shadow)) [[unlikely]] {
+        FrontSyncBackOwned(split, fs); // Rare: take render_enable.mode back from macro 0xe2c's runs
+    }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
@@ -1255,6 +1290,90 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         VideoCommon::Nx2MacroDiag::BeginMacro(method, engine.native_code, positions, start,
                                               engine.native_code_generation);
     }
+    // Ocarina's conditional rendering macro on the back (nx2_back_macro.h): only its exact code.
+    namespace BackMacro = Nx2BackMacro;
+    bool verify_back_macro = false;
+    std::array<u32, 16> verify_writes{};
+    u32 verify_write_count = 0;
+    if (method == BackMacro::kMacro && BackMacro::GetMode() != BackMacro::Mode::Off) [[unlikely]] {
+        BackMacro::Fallback fallback = BackMacro::Fallback::Count;
+        if (!BackMacro::CodeMatches(engine.native_code, start) ||
+            execution_mask[BackMacro::kMemAddressA] || execution_mask[BackMacro::kMemAddressB] ||
+            execution_mask[BackMacro::kDmaReadFifoed] ||
+            !execution_mask[BackMacro::kRenderEnableMode]) {
+            fallback = BackMacro::Fallback::Code;
+        } else if (Shader::Ampere::YoshiCompatibility().load(std::memory_order_relaxed)) {
+            fallback = BackMacro::Fallback::Yoshi;
+        } else if (fs.parameters.size() != BackMacro::kParameters) {
+            fallback = BackMacro::Fallback::Parameters;
+        }
+        if (fallback != BackMacro::Fallback::Count) {
+            BackMacro::Add(BackMacro::g_counters.fallbacks[static_cast<size_t>(fallback)]);
+        } else {
+            BackMacro::Add(BackMacro::g_counters.calls);
+            if (macro_diag) [[unlikely]] {
+                BackMacro::MaybeReport();
+            }
+            struct Call {
+                std::array<u32, BackMacro::kParameters> parameters;
+                u64 sequence;
+                u64 position;
+            };
+            const Call call{{fs.parameters[0], fs.parameters[1], fs.parameters[2]},
+                            ++fs.back_macro_sequence, split.WritePosition()};
+            if (BackMacro::GetMode() == BackMacro::Mode::Run) {
+                // The back runs it at this queue position, as the original's writes would run
+                // there (ConsumeSink, then CallMethod for each). The front's copies: the address
+                // registers and the read count follow from the parameters (what FrontWrite would
+                // store, shadow RAM applied); render_enable.mode depends on the words read and
+                // stays the back's until the front takes it back or sets it.
+                const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                                     fs.control == Regs::ShadowRamControl::TrackWithFilter;
+                const auto apply = [&fs, tracked](u32 reg, u32 argument) {
+                    u32 value = argument;
+                    if (tracked) {
+                        fs.shadow[reg] = argument;
+                    } else if (fs.control == Regs::ShadowRamControl::Replay) {
+                        value = fs.shadow[reg];
+                    }
+                    fs.regs[reg] = value;
+                };
+                apply(BackMacro::kMemAddressA, call.parameters[1]);
+                apply(BackMacro::kMemAddressB, call.parameters[2]);
+                apply(BackMacro::kDmaReadFifoed, BackMacro::kReadWords);
+                fs.back_owns_render_enable = true;
+                fs.back_owns_render_enable_shadow |= tracked;
+                split.Defer([this, system_ptr = &system, call] {
+                    BackRunMacroE2C(*system_ptr, call.parameters, false, call.sequence,
+                                    call.position);
+                });
+                if (macro_diag) [[unlikely]] {
+                    VideoCommon::Nx2MacroDiag::EndMacro(fs.draw_pending);
+                }
+                fs.parameters.clear();
+                // As after any macro (below): a draw manager method sent before this call may
+                // have left a deferred draw for the end of the macro.
+                if (fs.draw_pending) {
+                    fs.draw_pending = false;
+                    split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
+                    if (macro_diag) [[unlikely]] {
+                        VideoCommon::Nx2DmaReadDiag::NoteUnranged(
+                            VideoCommon::Nx2DmaReadDiag::Writer::Draw, split.WritePosition());
+                    }
+                }
+                if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+                    FrontVerify(split, fs);
+                }
+                return;
+            }
+            // Verify: the back's dry run goes in at the queue position the run would have, before
+            // the original's writes; its comparison after them (below).
+            verify_back_macro = true;
+            split.Defer([this, system_ptr = &system, call] {
+                BackRunMacroE2C(*system_ptr, call.parameters, true, call.sequence, call.position);
+            });
+        }
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1265,9 +1384,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const size_t parameter_count = fs.parameters.size();
         const auto result = engine.native_jit->Execute(
             start, fs.parameters, std::span<u32>{native_data_ram},
-            [&fs, macro_diag](u32 address) {
+            [this, &split, &fs, macro_diag](u32 address) {
                 if (macro_diag) [[unlikely]] {
                     VideoCommon::Nx2MacroDiag::OnRegisterRead(address);
+                }
+                if (address == Nx2BackMacro::kRenderEnableMode &&
+                    fs.back_owns_render_enable) [[unlikely]] {
+                    FrontSyncBackOwned(split, fs);
                 }
                 return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
             },
@@ -1277,6 +1400,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 }
                 if (macro_diag) [[unlikely]] {
                     VideoCommon::Nx2MacroDiag::OnRegisterWrite(address);
+                }
+                if (verify_back_macro) [[unlikely]] {
+                    if (verify_write_count < verify_writes.size() / 2) {
+                        verify_writes[verify_write_count * 2] = address;
+                        verify_writes[verify_write_count * 2 + 1] = value;
+                    }
+                    ++verify_write_count;
                 }
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
@@ -1290,6 +1420,31 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
                       start, result.consumed, parameter_count, result.error);
         }
+    }
+    if (verify_back_macro) [[unlikely]] {
+        // After the original's writes: the back compares them, the words its read put in the FIFO
+        // (after the parameters) and render_enable.mode with its dry run.
+        struct Compare {
+            std::array<u32, 16> writes;
+            u32 write_count;
+            std::array<u32, Nx2BackMacro::kReadWords> words;
+            u32 word_count;
+            u64 sequence;
+            u64 position;
+        };
+        Compare compare{verify_writes, verify_write_count, {}, 0, fs.back_macro_sequence,
+                        split.WritePosition()};
+        for (size_t i = Nx2BackMacro::kParameters;
+             i < fs.parameters.size() && compare.word_count < compare.words.size(); ++i) {
+            compare.words[compare.word_count++] = fs.parameters[i];
+        }
+        split.Defer([this, compare] {
+            BackCompareMacroE2C(
+                std::span<const u32>{compare.writes.data(),
+                                     2 * std::min<size_t>(compare.write_count, 8)},
+                std::span<const u32>{compare.words.data(), compare.word_count}, compare.sequence,
+                compare.position);
+        });
     }
     if (macro_diag) [[unlikely]] {
         VideoCommon::Nx2MacroDiag::EndMacro(fs.draw_pending);
@@ -1360,7 +1515,241 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
 }
 
+namespace {
+/// Verify mode: the back's dry run of the call being verified (back thread only).
+struct BackMacroDryRun {
+    u64 sequence{};
+    std::array<u32, 16> writes{}; ///< (register, value) pairs as the code emitted them
+    u32 write_count{};
+    std::array<u32, Nx2BackMacro::kReadWords> words{};
+    u32 word_count{};
+    bool dirty{};   ///< The buffer cache held GPU-modified words (not flushed: no side effects)
+    bool success{};
+};
+BackMacroDryRun g_back_macro_dry_run;
+
+u64 BackMacroNow() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // Anonymous namespace
+
+void Maxwell3D::FrontSyncBackOwned(VideoCommon::GpuSplit& split, FrontState& fs) {
+    namespace BackMacro = Nx2BackMacro;
+    if (!fs.back_owns_render_enable && !fs.back_owns_render_enable_shadow) {
+        return;
+    }
+    const u64 begin = BackMacroNow();
+    // Everything sent ran: the back's copies are final. render_enable.mode is executable, so never
+    // held in the back's method sink: its register is current.
+    split.Drain();
+    constexpr u32 reg = BackMacro::kRenderEnableMode;
+    if (fs.back_owns_render_enable) {
+        fs.regs[reg] = regs.reg_array[reg];
+    }
+    if (fs.back_owns_render_enable_shadow) {
+        fs.shadow[reg] = shadow_state.reg_array[reg];
+    }
+    fs.back_owns_render_enable = false;
+    fs.back_owns_render_enable_shadow = false;
+    BackMacro::Add(BackMacro::g_counters.syncs);
+    BackMacro::Add(BackMacro::g_counters.sync_ns, BackMacroNow() - begin);
+}
+
+void Maxwell3D::BackRunMacroE2C(Core::System& system, std::span<const u32> parameters, bool verify,
+                                u64 sequence, u64 position) {
+    namespace BackMacro = Nx2BackMacro;
+    const bool profiled = VideoCommon::Nx2Profile::Enabled();
+    const u64 begin = profiled ? BackMacroNow() : 0;
+    static TuringMacroInterpreter interpreter; // Back thread only
+    static std::vector<u32> fifo;
+    fifo.assign(parameters.begin(), parameters.end());
+    BackMacroDryRun& dry = g_back_macro_dry_run;
+    if (verify) {
+        dry = {};
+        dry.sequence = sequence;
+    } else {
+        // As the original's first write entry does before its call.
+        ConsumeSink(system);
+    }
+    // What ProcessShadowRam makes of a write, without its side effects (dry run).
+    const auto shadowed = [this](u32 reg, u32 argument) {
+        return shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay
+                   ? shadow_state.reg_array[reg]
+                   : argument;
+    };
+    u32 address_a = 0;
+    u32 address_b = 0;
+    bool flushed = false;
+    const auto emit = [&](u32 address, u32 value) -> bool {
+        if (address >= MacroRegistersStart) {
+            return false;
+        }
+        if (verify) {
+            if (dry.write_count < dry.writes.size() / 2) {
+                dry.writes[dry.write_count * 2] = address;
+                dry.writes[dry.write_count * 2 + 1] = value;
+            }
+            ++dry.write_count;
+        } else {
+            // As the original's MacroWrite entry runs it (GpuSplit::Execute, Direct).
+            VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
+            CallMethod(system, address, value, true);
+        }
+        if (address == BackMacro::kMemAddressA) {
+            address_a = verify ? shadowed(address, value) : regs.reg_array[address];
+        } else if (address == BackMacro::kMemAddressB) {
+            address_b = verify ? shadowed(address, value) : regs.reg_array[address];
+        } else if (address == BackMacro::kDmaReadFifoed) {
+            // As FrontDmaRead after its drain: the buffer cache writes GPU-modified words out
+            // first (the back owns it); reports are already in memory while the split runs.
+            const GPUVAddr source = (GPUVAddr{address_a & 0x1ffffff} << 32) | address_b;
+            const u32 count = std::min<u32>(value, 0x1000);
+            const size_t bytes = size_t{count} * sizeof(u32);
+            if (memory_manager.IsMemoryDirty(source, bytes, VideoCommon::CacheType::BufferCache)) {
+                if (verify) {
+                    dry.dirty = true;
+                } else {
+                    memory_manager.FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
+                    flushed = true;
+                }
+            }
+            for (u32 i = 0; i < count; ++i) {
+                const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+                fifo.push_back(word);
+                if (verify && dry.word_count < dry.words.size()) {
+                    dry.words[dry.word_count++] = word;
+                }
+            }
+        }
+        return true;
+    };
+    const auto read = [this](u32 reg) { return reg < Regs::NUM_REGS ? regs.reg_array[reg] : 0U; };
+    const auto result = interpreter.Execute(std::span<const u32>{BackMacro::kCode}, 0, fifo, read,
+                                            emit);
+    if (verify) {
+        dry.success = result.success;
+        if (!result.success) {
+            BackMacro::Add(BackMacro::g_counters.verify_failures);
+        }
+    } else if (result.success) {
+        BackMacro::Add(BackMacro::g_counters.back_runs);
+        if (flushed) {
+            BackMacro::Add(BackMacro::g_counters.back_flushes);
+        }
+    } else {
+        BackMacro::Add(BackMacro::g_counters.back_failures);
+    }
+    if (!result.success) {
+        static u32 logged{};
+        if (logged < 16) {
+            ++logged;
+            LOG_ERROR(HW_GPU, "nx2: back macro {:#x} {} failed (call {}, queue position {}): {}",
+                      BackMacro::kMacro, verify ? "dry run" : "run", sequence, position,
+                      result.error);
+        }
+    }
+    if (profiled) {
+        BackMacro::Add(verify ? BackMacro::g_counters.verify_ns : BackMacro::g_counters.back_ns,
+                       BackMacroNow() - begin);
+    }
+}
+
+void Maxwell3D::BackCompareMacroE2C(std::span<const u32> writes, std::span<const u32> words,
+                                    u64 sequence, u64 position) {
+    namespace BackMacro = Nx2BackMacro;
+    const bool profiled = VideoCommon::Nx2Profile::Enabled();
+    const u64 begin = profiled ? BackMacroNow() : 0;
+    const BackMacroDryRun& dry = g_back_macro_dry_run;
+    BackMacro::Add(BackMacro::g_counters.verified);
+    constexpr u32 reg = BackMacro::kRenderEnableMode;
+    const bool same_words = dry.word_count == words.size() &&
+                            std::equal(words.begin(), words.end(), dry.words.begin());
+    if (!same_words) {
+        BackMacro::Add(BackMacro::g_counters.word_differences);
+    }
+    if (dry.dirty) {
+        BackMacro::Add(BackMacro::g_counters.verify_dirty);
+    }
+    // The writes in order, then render_enable.mode as the original's writes left it here.
+    const u32 original_count = static_cast<u32>(writes.size() / 2);
+    const u32 dry_count = std::min<u32>(dry.write_count, static_cast<u32>(dry.writes.size() / 2));
+    std::string_view problem;
+    u32 problem_reg = 0;
+    u32 original_value = 0;
+    u32 back_value = 0;
+    u32 dry_mode = 0;
+    bool dry_writes_mode = false;
+    for (u32 i = 0; i < dry_count; ++i) {
+        if (dry.writes[i * 2] == reg) {
+            dry_mode = dry.writes[i * 2 + 1];
+            dry_writes_mode = true;
+        }
+    }
+    if (dry.sequence != sequence) {
+        problem = "the dry run for this call is missing";
+    } else if (!dry.success) {
+        problem = "the dry run failed";
+    } else if (original_count != dry.write_count) {
+        problem = "different numbers of writes";
+        original_value = original_count;
+        back_value = dry.write_count;
+    } else {
+        for (u32 i = 0; i < original_count; ++i) {
+            if (writes[i * 2] != dry.writes[i * 2] || writes[i * 2 + 1] != dry.writes[i * 2 + 1]) {
+                problem = writes[i * 2] != dry.writes[i * 2] ? "a write to another register"
+                                                             : "a write with another value";
+                problem_reg = writes[i * 2];
+                original_value = writes[i * 2 + 1];
+                back_value = dry.writes[i * 2 + 1];
+                break;
+            }
+        }
+        if (problem.empty() && dry_writes_mode) {
+            const u32 expected = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay
+                                     ? shadow_state.reg_array[reg]
+                                     : dry_mode;
+            if (regs.reg_array[reg] != expected) {
+                problem = "render_enable.mode differs after the original's writes";
+                problem_reg = reg;
+                original_value = regs.reg_array[reg];
+                back_value = expected;
+            }
+        }
+    }
+    if (!problem.empty()) {
+        const u64 count = BackMacro::g_counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 32 || count % 4096 == 0) {
+            std::array<u32, BackMacro::kReadWords> original_words{};
+            std::copy_n(words.begin(), std::min(words.size(), original_words.size()),
+                        original_words.begin());
+            LOG_ERROR(HW_GPU,
+                      "nx2: back macro {:#x} verify mismatch {} (call {}, queue position {}): {}; "
+                      "register {:#x} original {:#x} back {:#x}; words {} (original {:08x}, back "
+                      "{:08x}); back read GPU-modified words: {}; render_enable.mode now {:#x}",
+                      BackMacro::kMacro, count, sequence, position, problem, problem_reg,
+                      original_value, back_value, same_words ? "same" : "DIFFER",
+                      fmt::join(original_words, ","), fmt::join(dry.words, ","), dry.dirty,
+                      regs.reg_array[reg]);
+        }
+    } else if (!same_words) {
+        static u32 logged{};
+        if (logged < 8) {
+            ++logged;
+            LOG_WARNING(HW_GPU,
+                        "nx2: back macro {:#x} verify (call {}): same result from different words "
+                        "(original {:08x}, back {:08x})",
+                        BackMacro::kMacro, sequence, fmt::join(words, ","), fmt::join(dry.words, ","));
+        }
+    }
+    if (profiled) {
+        BackMacro::Add(BackMacro::g_counters.verify_ns, BackMacroNow() - begin);
+    }
+}
+
 void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+    FrontSyncBackOwned(split, fs);
     split.Drain();
     static u64 checks{};
     static u64 differences{};
