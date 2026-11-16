@@ -1071,3 +1071,12 @@ by the user; success = lower walking "method" zone AND lower frame time / higher
   overlap, any, unrelated, overflow), notes which writers are queued, the top macros and source
   pages. Log lines every 10 s start with "nx2: macro DMA read". No change to synchronization or
   rendering; build 11 changes, build 9 batching and the Yoshi fixes unchanged.
+
+## Branch fix/green-hat — green-hat-build-15 (diagnostic: macro 0xe2c)
+- Build 14 result: all ~15,500 macro DMA reads a second (walking) come from macro 0xe2c, 24 bytes into
+  its FIFO; a draw is queued before ~76 % of them, so a narrower wait would save only ~1.6-1.9 ms per
+  walking frame (not pursued).
+- Diagnostic only (profile on): logs 0xe2c's code once, its front time net of DMA read drains, its
+  register reads and writes, and later front work that depends on registers it wrote (other macros,
+  the front's same-value check); every macro's net front time. Log lines start with "nx2: macro 0xe2c"
+  and "nx2: front macros". The build 14 DMA read diagnostic stays. No behaviour change.
