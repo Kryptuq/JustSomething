@@ -1080,3 +1080,12 @@ by the user; success = lower walking "method" zone AND lower frame time / higher
   register reads and writes, and later front work that depends on registers it wrote (other macros,
   the front's same-value check); every macro's net front time. Log lines start with "nx2: macro 0xe2c"
   and "nx2: front macros". The build 14 DMA read diagnostic stays. No behaviour change.
+
+## Branch fix/green-hat — green-hat-build-16 (Ocarina macro 0xe2c on the back: VERIFY MODE by default)
+- Build 15 result: macro 0xe2c = software conditional rendering (reads a 24-byte report compare,
+  sets render_enable.mode); 0.36 us per call, but ~7.3 ms of full split drains per walking frame.
+- New path for exactly that macro code only (src/video_core/engines/nx2_back_macro.h), switch
+  EDEN_NX2_BACK_MACROS: unset/2/verify = default, original path authoritative + back dry run and
+  comparison (log lines "nx2: back macro 0xe2c"); 1/on/run = run on the back (opt-in, not yet to be
+  used for testing); 0/off = original path only.
+- Builds 14/15 diagnostics stay. Yoshi: excluded (exact code match + Yoshi compatibility check).
